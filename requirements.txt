@@ -1,0 +1,4 @@
+matplotlib>=3.6
+numpy>=1.24
+h5py>=3.8
+# `torch` is provided by the base image (pytorch/pytorch) to ensure CUDA support inside the container.

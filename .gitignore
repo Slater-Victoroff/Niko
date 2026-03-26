@@ -1,0 +1,37 @@
+# Minimal Python .gitignore — essential items only
+
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Test cache
+.pytest_cache/
+
+# Environment files
+.env
+.env.*
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+data/
+niko_samples/
+src/*.pt

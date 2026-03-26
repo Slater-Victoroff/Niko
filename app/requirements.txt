@@ -1,0 +1,5 @@
+# Ensure a NumPy 1.x is used (many binary extensions still target 1.x)
+numpy<2
+
+# Minimal requirements; PyTorch with CUDA is provided by the base image.
+the_well

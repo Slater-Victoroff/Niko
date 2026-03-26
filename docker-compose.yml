@@ -1,0 +1,24 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    runtime: nvidia
+    gpus: all
+    volumes:
+      - ~/Projects/Niko/data:/app/data
+      # Mount the real dataset path so symlinks inside the repo resolve in-container
+      - ~/datasets:/app/data/datasets:ro
+      - ./src:/app/src:cached
+      - ./niko_samples:/app/niko_samples
+    command: ["python", "/app/src/runtime.py"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import torch; print('cuda', torch.cuda.is_available()); print('cudnn', torch.backends.cudnn.version())\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
