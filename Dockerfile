@@ -23,5 +23,7 @@ RUN pip install -r /app/requirements.txt
 
 # create src dir (compose mounts will override during development)
 RUN mkdir -p /app/src
+# copy configs into the image so built images include example configs
+COPY configs /app/configs
 
 WORKDIR /app/src

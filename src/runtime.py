@@ -194,7 +194,6 @@ def main():
 		DATA_DIR,
 		batch_size=BATCH_SIZE,
 		num_workers=NUM_WORKERS,
-		stack_frames=True,
 		context_frames=CONTEXT_FRAMES,
 		predict_frames=PREDICT_FRAMES,
 		train_file_limit=None,

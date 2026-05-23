@@ -11,10 +11,12 @@ services:
     runtime: nvidia
     gpus: all
     volumes:
-      - ~/Projects/Niko/data:/app/data
-      # Mount the real dataset path so symlinks inside the repo resolve in-container
-      - ~/datasets:/app/data/datasets:ro
+      # Mount the project data directory's datasets subfolder directly to avoid
+      # symlink resolution issues. Replace the absolute host path below if needed.
+      - /home/sl8rv/Projects/Niko/data/datasets:/app/data/datasets:ro
       - ./src:/app/src:cached
+      # Mount local configs so you can edit them without rebuilding the image
+      - ./configs:/app/configs:cached
       - ./niko_samples:/app/niko_samples
     command: ["python", "/app/src/runtime.py"]
     healthcheck:
