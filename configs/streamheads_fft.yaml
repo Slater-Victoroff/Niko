@@ -1,3 +1,8 @@
+# Same as streamheads.yaml, except encoder.name: split_encoder_fft -- the complex
+# branch is fed from an rfft2 of the last raw context frame (cropped to match
+# real_net's output resolution) instead of a from-scratch learned CNN. Everything
+# else (operator, decoder, real_net) is identical, for an apples-to-apples
+# comparison against streamheads.yaml.
 # rollout_steps and context_frames are passed as CLI args to train.py / eval scripts.
 anchor_target: true
 param_encoder:
@@ -6,7 +11,7 @@ param_encoder:
   h_dim: 64
 
 encoder:
-  name: split_encoder
+  name: split_encoder_fft
   in_channels: 4
   latent_dim: 16
   hidden_dim: 64

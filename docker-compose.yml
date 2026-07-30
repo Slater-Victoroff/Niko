@@ -11,14 +11,15 @@ services:
     runtime: nvidia
     gpus: all
     volumes:
-      # Mount the project data directory's datasets subfolder directly to avoid
-      # symlink resolution issues. Replace the absolute host path below if needed.
       - /home/sl8rv/Projects/Niko/data/datasets:/app/data/datasets:ro
       - ./src:/app/src:cached
-      # Mount local configs so you can edit them without rebuilding the image
-      - ./configs:/app/configs:cached
+      - ./checkpoints:/app/checkpoints
+      - ./configs:/app/configs
       - ./niko_samples:/app/niko_samples
-    command: ["python", "/app/src/runtime.py"]
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./README.md:/app/README.md:ro
+    working_dir: /app
+    command: sleep infinity
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import torch; print('cuda', torch.cuda.is_available()); print('cudnn', torch.backends.cudnn.version())\" || exit 1"]
       interval: 10s
