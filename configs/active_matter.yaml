@@ -1,0 +1,44 @@
+# First active_matter config: simplest possible choice at every layer, since
+# this is the initial correctness/wiring test for the new field_spec/decoder/
+# param_encoder generalization, not a real architecture decision yet.
+# Dataset composition (field_spec: active_matter): concentration (scalar) +
+# velocity (vector x2) + D (tensor 2x2, 4 flat channels) + E (tensor 2x2, 4
+# flat channels) = 11 raw channels. Params: L (constant across the dataset),
+# zeta, alpha (alpha is negative -- identity transform, not log10, which
+# would NaN on negative input).
+#
+# use_streamfunction is left off: the divergence-free-velocity trick is a
+# real physical assumption (2D incompressibility) that's known-valid for
+# rayleigh_benard/shear_flow but unverified for active_matter's constitutive
+# model -- safer to not assume it here.
+# rollout_steps and context_frames are passed as CLI args to train.py / eval scripts.
+field_spec: active_matter
+anchor_target: true
+
+param_encoder:
+  name: multi_param
+  cond_dim: 32
+  h_dim: 64
+  transforms: [identity, identity, identity]  # L, zeta, alpha
+
+encoder:
+  name: sequence_conv
+  in_channels: 11
+  latent_dim: 16
+  hidden_dim: 64
+
+operator:
+  name: film_helmholtz
+  latent_dim: 16
+  hidden_dim: 64
+  cond_dim: 32
+
+decoder:
+  name: shared_heads
+  latent_dim: 16
+  hidden_dim: 48
+  upsample: 2
+  zero_mean_pressure: false
+  use_streamfunction: false
+  scalar_field_names: [concentration]
+  tensor_field_names: [D, E]

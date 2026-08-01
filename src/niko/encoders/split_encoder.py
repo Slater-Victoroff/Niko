@@ -8,7 +8,7 @@ from typing import Literal, Optional
 
 from core.modules import EncoderBase, validate_call
 from core.states import LatentState, Params
-from core.blocks import ConvNeXtBlock, FiLMConvNeXtBlock
+from core.blocks import ConvNeXtBlock, FiLMConvNeXtBlock, LocallyConnected1x1
 
 
 class SplitEncoder(EncoderBase):
@@ -294,3 +294,96 @@ class FFTSplitEncoderWide(EncoderBase):
         z_complex = torch.complex(re, im)
 
         return LatentState(real_grid=z, spectral_grid=z_complex)
+
+
+class FusedSpectralEncoderBig(EncoderBase):
+    """FusedSpectralEncoder, sized up to genuinely use more parameters
+    without meaningfully increasing per-step compute -- two cheap-param /
+    ~free-FLOPs levers, not a wider trunk:
+
+      - real_net/fuse_net's ConvNeXtBlocks use a wider depthwise kernel
+        (kernel_size, default 11 vs. the original 7). Depthwise conv cost
+        scales as dim*K^2 (linear in channels); the block's pointwise convs
+        (its actual FLOP majority) are untouched and scale as dim^2 --
+        widening K adds real depthwise params for a small relative compute
+        cost.
+      - complex_proj becomes a LocallyConnected1x1 (per-frequency-bin
+        weights instead of one shared 1x1 conv across the whole cropped
+        spectrum) -- the exact same multiply-add count as the shared
+        version (same op, just unshared weights), so vastly more
+        parameters in that one projection for ~0 added FLOPs. This is the
+        dominant source of the size increase here: with this project's
+        fixed 128x512 Rayleigh-Benard grid, the cropped spectrum is
+        64x129 = 8,256 positions, taking complex_proj from 288 params
+        (shared) to ~2.4M (unshared).
+
+    Unlike a plain conv, LocallyConnected1x1 needs the *exact* input
+    spatial size in advance to size its weight tensor -- grid_h/grid_w
+    default to this project's dataset resolution (128x512); override if
+    training against a different one.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        context_frames: int,
+        latent_dim: int = 16,
+        hidden_dim: int = 64,
+        cond_dim: Optional[int] = None,
+        kernel_size: int = 11,
+        grid_h: int = 128,
+        grid_w: int = 512,
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.context_frames = context_frames
+        self.latent_dim = latent_dim
+        self.hidden_dim = int(hidden_dim // math.sqrt(2))
+
+        total_in = in_channels * context_frames
+
+        self.real_net = nn.Sequential(
+            nn.Conv2d(total_in, self.hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            ConvNeXtBlock(self.hidden_dim, kernel_size=kernel_size),
+
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+
+            ConvNeXtBlock(self.hidden_dim, kernel_size=kernel_size),
+
+            nn.Conv2d(self.hidden_dim, self.latent_dim, kernel_size=1),
+        )
+
+        # Matches real_net's single stride-2 downsample, then rfft2_crop's own
+        # cropping (out_h rows total via top+bottom half-stack, out_w//2+1
+        # columns from the rfft half-spectrum convention) -- see rfft2_crop.
+        out_h, out_w = grid_h // 2, grid_w // 2
+        crop_h, crop_w = out_h, out_w // 2 + 1
+        self.complex_proj = LocallyConnected1x1(2 * in_channels, 2 * latent_dim, grid_h=crop_h, grid_w=crop_w)
+
+        self.fuse_net = nn.Sequential(
+            nn.Conv2d(2 * latent_dim, self.hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            ConvNeXtBlock(self.hidden_dim, kernel_size=kernel_size),
+            nn.Conv2d(self.hidden_dim, latent_dim, kernel_size=1),
+        )
+
+    def forward(self, x: Tensor, cond: Tensor | None = None, params: Params | None = None) -> LatentState:
+        reshaped_context = x.view(x.shape[0], self.context_frames * self.in_channels, x.shape[3], x.shape[4])
+        z_real = self.real_net(reshaped_context)
+
+        last_frame = x[:, -1]
+        spec = rfft2_crop(last_frame, out_h=z_real.shape[-2], out_w=z_real.shape[-1])
+        spec_ri = torch.cat([spec.real, spec.imag], dim=1)
+        proj = self.complex_proj(spec_ri)
+        re, im = proj.chunk(2, dim=1)
+        z_complex = torch.complex(re, im)
+
+        z_complex_real = torch.fft.irfft2(z_complex, s=(z_real.shape[-2], z_real.shape[-1]), norm="ortho")
+
+        fused = torch.cat([z_real, z_complex_real], dim=1)
+        z_out = self.fuse_net(fused)
+
+        return LatentState(real_grid=z_out)

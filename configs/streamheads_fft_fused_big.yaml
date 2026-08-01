@@ -1,0 +1,39 @@
+# Same as streamheads_fft_fused.yaml, except encoder.name: fused_spectral_encoder_big --
+# widened depthwise kernels (7->11) in real_net/fuse_net's ConvNeXtBlocks and
+# complex_proj untied into per-frequency-bin weights (LocallyConnected1x1)
+# instead of one shared 1x1 conv. Both levers add real parameters with ~0
+# added FLOPs (depthwise conv scales with channels, not channels^2; the
+# locally-connected layer is the exact same multiply-add count as the shared
+# conv it replaces, just unshared weights) -- meant to use up spare capacity
+# without hurting per-step throughput. Encoder goes from ~113K params
+# (fused_spectral_encoder) to ~2.5M, almost entirely from complex_proj.
+# grid_h/grid_w default to this project's fixed 128x512 Rayleigh-Benard grid.
+# rollout_steps and context_frames are passed as CLI args to train.py / eval scripts.
+anchor_target: true
+param_encoder:
+  name: rb_param
+  cond_dim: 32
+  h_dim: 64
+
+encoder:
+  name: fused_spectral_encoder_big
+  in_channels: 4
+  latent_dim: 16
+  hidden_dim: 64
+  kernel_size: 11
+  grid_h: 128
+  grid_w: 512
+
+operator:
+  name: film_helmholtz
+  latent_dim: 16
+  hidden_dim: 64
+  cond_dim: 32
+
+decoder:
+  name: shared_heads
+  latent_dim: 16
+  hidden_dim: 48
+  upsample: 2
+  zero_mean_pressure: true
+  use_streamfunction: true

@@ -1,7 +1,9 @@
-from encoders.param_encoder import RBParamEncoder
+from encoders.param_encoder import RBParamEncoder, MultiParamEncoder
 
 from encoders.sequence_conv import SequenceConvEncoder
-from encoders.split_encoder import SplitEncoder, FFTSplitEncoder, FFTSplitEncoderWide, FusedSpectralEncoder
+from encoders.split_encoder import (
+    SplitEncoder, FFTSplitEncoder, FFTSplitEncoderWide, FusedSpectralEncoder, FusedSpectralEncoderBig,
+)
 
 from operators.linear_local import LinearLocalOperator
 from operators.transport_operator import (
@@ -26,6 +28,7 @@ def build_param_encoder(cfg):
 
     param_encoder_map = {
         "rb_param": RBParamEncoder,
+        "multi_param": MultiParamEncoder,
     }
 
     cls = param_encoder_map.get(name)
@@ -44,6 +47,7 @@ def build_encoder(cfg):
         "split_encoder_fft": FFTSplitEncoder,
         "split_encoder_fft_wide": FFTSplitEncoderWide,
         "fused_spectral_encoder": FusedSpectralEncoder,
+        "fused_spectral_encoder_big": FusedSpectralEncoderBig,
     }
 
     cls = encoder_map.get(name)

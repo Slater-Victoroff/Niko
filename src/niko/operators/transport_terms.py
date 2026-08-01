@@ -103,12 +103,31 @@ class AdvectionTerm(nn.Module):
 
 
 class DiffusionTerm(nn.Module):
-    def __init__(self, log_nu_init: float = -7.0):
-        super().__init__()
-        self.log_nu = nn.Parameter(torch.tensor(log_nu_init))
+    """nu * laplacian(x), where nu = exp(log_nu(cond)) is predicted per-sample
+    from the conditioning vector instead of being one global scalar shared
+    across every Rayleigh/Prandtl regime -- diffusivity plausibly does
+    depend on the regime, so a single fixed nu for the whole dataset was a
+    real (if convenient) modeling assumption, not an obviously correct one.
 
-    def forward(self, z: LatentState, cond: Optional[Tensor] = None) -> Tensor:
-        nu = torch.exp(torch.clamp(self.log_nu, min=-12.0, max=math.log(0.25)))
+    Zero-inited (weight only, bias keeps log_nu_init) so log_nu(cond) ==
+    log_nu_init for every cond at the start of training -- matches this
+    project's zero-init convention for newly-conditioned terms elsewhere
+    (FiLMConvNeXtBlock's film layer, DirectFieldOperator's head,
+    FFTSplitEncoderWide's complex_proj output): starts out behaving exactly
+    like the old unconditioned DiffusionTerm, and only diverges per-regime
+    as training finds it useful.
+    """
+
+    def __init__(self, cond_dim: int, log_nu_init: float = -7.0):
+        super().__init__()
+        self.log_nu_head = nn.Linear(cond_dim, 1)
+        nn.init.zeros_(self.log_nu_head.weight)
+        nn.init.constant_(self.log_nu_head.bias, log_nu_init)
+
+    def forward(self, z: LatentState, cond: Tensor) -> Tensor:
+        log_nu = self.log_nu_head(cond)  # [B, 1]
+        log_nu = torch.clamp(log_nu, min=-12.0, max=math.log(0.25))
+        nu = torch.exp(log_nu)[:, :, None, None]  # [B, 1, 1, 1], broadcasts over channels+spatial
         return nu * laplacian(z.real_grid)
 
 
@@ -123,13 +142,29 @@ class ForcingTerm(nn.Module):
 
 
 class SkewTerm(nn.Module):
-    def __init__(self, latent_dim: int):
-        super().__init__()
-        self.skew_raw = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+    """Learned skew-symmetric channel-mixing matrix, predicted per-sample
+    from the conditioning vector instead of one global matrix shared across
+    every Rayleigh/Prandtl regime.
 
-    def forward(self, z: LatentState, cond: Optional[Tensor] = None) -> Tensor:
-        k = self.skew_raw - self.skew_raw.transpose(0, 1)
-        return torch.einsum("ij,bjhw->bihw", k, z.real_grid)
+    Zero-inited (weight AND bias) so the predicted matrix is exactly zero
+    for every cond at the start of training -- matches skew_raw's own
+    original zero-init (torch.zeros(latent_dim, latent_dim)): this term
+    still starts as a true no-op regardless of conditioning, and only grows
+    a (now per-regime) mixing matrix as training finds it useful.
+    """
+
+    def __init__(self, latent_dim: int, cond_dim: int):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.skew_head = nn.Linear(cond_dim, latent_dim * latent_dim)
+        nn.init.zeros_(self.skew_head.weight)
+        nn.init.zeros_(self.skew_head.bias)
+
+    def forward(self, z: LatentState, cond: Tensor) -> Tensor:
+        b = cond.shape[0]
+        skew_raw = self.skew_head(cond).view(b, self.latent_dim, self.latent_dim)
+        k = skew_raw - skew_raw.transpose(-1, -2)
+        return torch.einsum("bij,bjhw->bihw", k, z.real_grid)
 
 
 class ComplexRotationTerm(nn.Module):

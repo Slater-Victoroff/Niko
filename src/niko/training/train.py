@@ -36,6 +36,7 @@ def train(
     context_frames: int,
     rollout_steps: int,
     param_subset: str | None = None,
+    soap_max_precond_dim: int = 10000,
     debug_timing: bool = False,
     log_physics: bool = False,
     log_grad_norms: bool = False,
@@ -53,15 +54,13 @@ def train(
 
     is_direct = cfg.get("model_type") == "direct"
 
+    # encoder.in_channels must match field_spec's total channel count (4 for RB/shear_flow,
+    # 11 for active_matter's concentration+velocity+D+E, etc.) -- no longer asserted to a
+    # fixed "4" here; a real mismatch is still caught loudly, just by the dataloader's own
+    # field_spec-driven channel assertion in H5RayleighBenardFields.__getitem__, which knows
+    # the actual expected count for whatever field_spec is configured, rather than this
+    # function hardcoding RB's specific case.
     if not is_direct:
-        enc = cfg["encoder"]
-        in_ch = enc.get("in_channels", 2)
-        if in_ch != 4:
-            raise ValueError(
-                "Rayleigh-Benard training requires encoder.in_channels=4 for physical channels "
-                "[pressure, buoyancy, velocity_x, velocity_y]. "
-                f"Got in_channels={in_ch}."
-            )
         # Patch cfg before build_model so the encoder receives the correct context_frames.
         cfg["encoder"]["context_frames"] = T
 
@@ -77,6 +76,19 @@ def train(
             param_choices = [tuple(c) for c in json.load(f)["combos"]]
         print(f"Restricting to param subset {param_subset}: {param_choices}")
 
+    # field_spec (which HDF5 datasets to load and how to stack them into channels) lives in
+    # the training config itself, same as encoder/operator/decoder -- either a named preset
+    # (e.g. "active_matter", resolved below) or an inline list of {"key":..., "n_components":...}
+    # dicts, for a dataset with no named preset yet. None (the default, RB's own configs never
+    # set this key) keeps the original RB_FIELD_SPEC default inside create_param_dataloaders.
+    field_spec = cfg.get("field_spec")
+    if isinstance(field_spec, str):
+        field_spec = {
+            "rayleigh_benard": dl.RB_FIELD_SPEC,
+            "active_matter": dl.ACTIVE_MATTER_FIELD_SPEC,
+            "shear_flow": dl.SHEAR_FLOW_FIELD_SPEC,
+        }[field_spec]
+
     train_loader, val_loader, _ = dl.create_param_dataloaders(
         data_dir,
         batch_size=batch,
@@ -86,10 +98,11 @@ def train(
         train_file_limit=train_file_limit,
         val_file_limit=val_file_limit,
         param_choices=param_choices,
+        field_spec=field_spec,
     )
     print(f"Using real dataloader from {data_dir}")
 
-    opt = SOAP(model.parameters(), lr=lr)
+    opt = SOAP(model.parameters(), lr=lr, max_precond_dim=soap_max_precond_dim)
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     total_batches = len(train_loader)
@@ -271,6 +284,13 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--data-dir", default="/app/data/datasets/rayleigh_benard/data")
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--soap-max-precond-dim", type=int, default=10000,
+                    help="SOAP skips preconditioning any parameter axis wider than this (falls back to "
+                         "plain per-axis scaling on that axis instead). Default (10000) matches SOAP's "
+                         "own default and is fine for every recipe so far; lower it (e.g. 1024) for "
+                         "parameters with a very wide axis (e.g. LocallyConnected1x1's per-position "
+                         "weight tensor) -- SOAP's eigh-based preconditioner update crashes cusolver "
+                         "on large-enough covariance matrices otherwise, rather than just being slow.")
     p.add_argument("--train-file-limit", type=int, default=None)
     p.add_argument("--val-file-limit", type=int, default=None)
     p.add_argument("--param-subset", default=None,
@@ -309,6 +329,7 @@ def main():
         context_frames=args.context_frames,
         rollout_steps=args.rollout_steps,
         param_subset=args.param_subset,
+        soap_max_precond_dim=args.soap_max_precond_dim,
         log_interval=args.log_interval,
         debug_timing=args.debug_timing,
         log_physics=args.log_physics,

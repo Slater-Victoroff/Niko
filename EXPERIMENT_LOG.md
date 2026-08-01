@@ -1,0 +1,103 @@
+# Experiment log: Niko (latent dynamics surrogate for The Well's physics datasets)
+
+A running record of architecture search, training methodology, and dataset generalization — condensed to conclusions and numbers, not the full blow-by-blow. Full history is in git if needed. This file didn't exist before this session; the "pre-session" note in §1 covers what's recoverable about earlier work from git archaeology.
+
+**Task** predict future frames of a 2D physical simulation from a short context window, via encode → latent-space operator rollout → decode &nbsp;·&nbsp; **Datasets** The Well (rayleigh_benard, active_matter, shear_flow) &nbsp;·&nbsp; **Compute** Docker + 2x RTX 5000 Ada
+
+---
+
+## Where things stand
+
+> **The `split_encoder`/`complex_operator` architecture (the one actively developed this session) had never been trained on a full dataset before now — a clean retrain beat the plain baseline meaningfully.** See §2-3: an FFT-fed complex branch (real spectrum instead of a from-scratch learned CNN) matches baseline quality at half the encoder params, and once its wide-variant's divergence bug was root-caused and fixed (zero-init + a bounded per-step multiplicative ceiling), it *slightly* beat baseline on a broad8 subset (0.211 vs 0.216 valid_loss, 7 epochs).
+>
+> **Fully conditioning the operator's diffusion/skew terms on Rayleigh/Prandtl (previously silently global) gave a small, real, seed-consistent improvement (§3).**
+>
+> **A pure-reconstruction autoencoder pretrained on the same encoder/decoder architecture landed meaningfully below every joint-trained full model (§4) — confirms the encoder/decoder round-trip, not the operator, is the binding ceiling on how low any of these numbers can go.** The operator's own marginal contribution to end-to-end error is already small; further gains need encoder/decoder capacity, not operator tuning.
+>
+> **A from-scratch JEPA-style operator (frozen pretrained encoder/decoder, pure latent-space MSE loss, no decoder in the training loop) plateaued badly — a settled negative result, not a training-time artifact (§5).** Decoded vrmse got stuck at ~11.3-11.5 for 4 straight epochs after an initial drop from ~12.1, dramatically worse than any joint-trained model (~0.2-0.6 range across all three datasets). Killed before completion.
+>
+> **Generalized the whole pipeline beyond rayleigh_benard to any Well-format dataset (§6) — two real, non-obvious bugs found and fixed along the way, not just plumbing.** `active_matter`'s square 256x256 grid broke the existing length-based axis inference (ambiguous when x_len==y_len); switched to a position-based convention, verified against all three datasets' actual on-disk layout. Filename-regex param parsing was replaced with reading `simulation_parameters` directly from each file's own HDF5 attrs (dataset-agnostic, no per-dataset regex) — but the exact-float-equality matching this enabled silently dropped `--param-subset` combos whose value isn't exactly binary-representable (0.1, 0.2, ...), a real regression caught empirically (2 of 8 shear_flow combos silently missing) and fixed with a significant-figure-rounded match key.
+>
+> **First real training runs on both new datasets are in flight/done**: `active_matter` (tensor-field decoder heads, concentration+velocity+D+E) reached valid_loss 0.446-0.567 over 4 epochs before being stopped; `shear_flow` (streamfunction-derived velocity, physically justified there unlike active_matter) is running now on a corrected 8-combo subset. Neither number is comparable to rayleigh_benard's or to each other's — different physical systems, different channel compositions, `well_style_vrmse`'s per-channel variance normalization operates on a different distribution each time.
+
+---
+
+## 1. Pre-session context, package restructure, and a GPU driver incident
+
+**Pre-session (recovered from git archaeology, not directly observed):** an earlier architecture search (flat `src/*.py` layout, committed May 23) settled on a `sequence_conv` encoder + `film_helmholtz` operator recipe, ctx6/roll6, converging to ~0.225-0.28 val_loss on the full rayleigh_benard dataset (35 combos) after dozens of runs. A follow-up physics-informed `DirectFieldOperator` baseline (pressure derived analytically from buoyancy via a hydrostatic Poisson relation, streamfunction-derived divergence-free velocity) was started but never got past 4 epochs (ctx1/roll1, VRMSE ~0.72-0.74, unconverged) before the session ended.
+
+**This session opened on an uncommitted package restructure** (flat `src/` → installable `src/niko/` package, new `eval/`/`export/` subpackages) sitting alongside a broken GPU: `unattended-upgrades` had silently bumped `nvidia-driver-580` mid-session (580.159.03 kernel module vs 580.173.02 userspace), and Xorg holding the module open meant only a reboot fixed it. Committed the restructure to a new branch (`explore/fft-complex-encoder`) after the reboot, keeping checkpoints untracked (git-ignored) and out of the diff.
+
+**`--param-subset` (a JSON list of specific parameter combos) added to `train.py`/`dataloader.py`** for fast iteration without paying for the full dataset — this is what every "broad8" run below uses (8 combos spanning the parameter range, vs. all 35 for rayleigh_benard).
+
+## 2. FFT-fed complex-branch encoder: does a real spectrum beat a learned one?
+
+**Motivating question**: `split_encoder`'s complex branch (`complex_net`) is a from-scratch learned CNN trying to invent a complex latent from raw pixels. Does feeding it an *actual* `rfft2` of the last frame instead work as well, more cheaply?
+
+**`split_encoder_fft`**: complex branch replaced by `rfft2_crop` (orthonormal, exact spectral downsampling — no learned approximation) + a single 1x1 conv projection. Half the encoder params (80,764 vs 163,128), ~half the forward time, no quality loss on an initial 2-combo/3-epoch check (0.645 both variants).
+
+**First attempt at scaling the complex branch back up diverged.** `split_encoder_fft_wide` (wider depthwise kernel in `real_net`/`fuse_net`'s `ConvNeXtBlock`s, `complex_proj` untied into per-frequency-bin weights via a new `LocallyConnected1x1` — same FLOPs as the shared conv it replaces, ~8,300x more params in that one projection) trained cleanly through epoch 3, then diverged progressively worse through epoch 7 (one isolated spike at epoch 4, never recovered, final valid_loss 1.66 vs epoch-3's 0.216). Root-caused: `complex_proj`'s output layer wasn't zero-inited (unlike every other newly-conditioned term in this codebase), so an uncontrolled random-scale signal fed the operator's multiplicative `spectral_grid * exp(amplitude + i*rotation)` term every rollout step — compounding over 6 steps. **Fixed with two changes**: zero-init `complex_proj`'s output layer (matches this codebase's established convention), and a new `amplitude_scale` parameter on `TransportOperator` (default 1.0, unchanged behavior) tightening the per-step ceiling from `exp(±1)≈2.72x` to `exp(±0.5)≈1.65x` for the wide variant specifically. **Retry (broad8, 5 epochs) held clean through the exact epoch-4 point that broke before** — best result 0.261 at epoch 4, smooth monotonic improvement, no spikes.
+
+**`fused_spectral_encoder`**: goes further — `irfft2`s the complex branch back to real space and fuses with `real_net`'s output via a learned conv into a single real latent, no persistent `spectral_grid` at all (pairs with `film_helmholtz`, not `complex_operator`, since there's nothing left for a complex rotation term to act on). Full-dataset (35 combos) comparison against baseline, 3 epochs each: essentially tied on final quality (0.266 baseline vs 0.263 fused) but fused reached that quality in a third of the epochs (already at 0.263 after epoch 1).
+
+**`fused_spectral_encoder_big`**: same fused design, sized up via two compute-cheap levers — wider depthwise kernel (7→11, cheap since depthwise scales with channels not channels²) and the same `LocallyConnected1x1` trick for `complex_proj` (113K → 2.5M encoder params, ~22x). Confirmed same throughput as the small version (~430ms/batch). Hit one real bug: SOAP's preconditioner tried to eigendecompose an 8256x8256 covariance matrix for the new wide-axis weight and crashed cusolver — fixed with a `--soap-max-precond-dim` flag (default unchanged at 10000, explicitly capped to 1024 for this architecture). Broad8/7-epoch result: 0.211 best (epoch 7), a small real improvement over the small fused encoder's own 0.216 best, but the extra ~22x params bought only a marginal gain — consistent with §4's finding that encoder capacity isn't the dominant bottleneck.
+
+## 3. Fully conditioning the operator
+
+**Found**: of `film_helmholtz`'s four real terms (advection/diffusion/forcing/skew), only advection and forcing were actually FiLM-conditioned on Rayleigh/Prandtl — diffusion (`log_nu`) and skew (`skew_raw`) were single global learned parameters shared across every physical regime, despite `broad8` spanning 4 orders of magnitude in Rayleigh.
+
+**Fixed**: `DiffusionTerm`/`SkewTerm` now predict their (`log_nu`/skew-generating matrix) per-sample from `cond` via a small `Linear` head, zero-inited so both start identical to the old unconditioned behavior. Confirmed via direct gradient checks that both terms' own weights get real gradient immediately, while gradient reaching further back into `param_encoder` itself is provably exactly zero for the first ~2 optimizer steps (every conditioning gate in this codebase is zero-inited, and `d(Wx+b)/dx = W = 0` blocks the chain until the gate itself moves) — verified empirically (0.0 → 0.0 → 0.0037 → 0.039 over 4 real steps), not just asserted.
+
+**Broad8/7-epoch result (`fused_cond_broad8`, small fused encoder)**: 0.220 best (epoch 5-6), edges out the unconditioned version's 0.216 — real but modest.
+
+## 4. Autoencoder pretraining: where's the actual ceiling?
+
+**Built `train_autoencoder_baseline.py`**: `param_encoder`+`encoder`+`decoder` only, no operator, trained to reconstruct the last context frame directly (no rollout, no forward-prediction task). Measures the encoder/decoder round-trip's information ceiling, independent of the harder forward-time-prediction job.
+
+**Baseline architecture (`split_encoder`+`shared_heads`), broad8, 7 epochs: bottomed at 0.135 (epoch 5), below every joint-trained full model's own best (0.211-0.280 across all variants in §2-3).** Since a *perfect* operator, holding encoder/decoder fixed, can only ever asymptotically approach the reconstruction floor (decoding the exactly-correct predicted latent is exactly the autoencoding task), this means the operator has already extracted most of the value available from this encoder/decoder — further operator-only tuning has limited headroom; the real lever for pushing error down further is encoder/decoder capacity itself.
+
+## 5. JEPA-style operator training: a settled negative result
+
+**Built `train_jepa_operator.py`**: reuses the frozen (`param_encoder`, `encoder`, `decoder`) from §4's autoencoder checkpoint, trains *only* a new operator via a pure latent-space MSE loss (`LatentState.grid` of predicted vs. target latent) — no decoder in the training loop at all. No stop-gradient/EMA target network needed (unlike from-scratch two-tower JEPA): the encoder is frozen and was pretrained via reconstruction, which already structurally rules out representation collapse.
+
+**Target-latent construction**: since the frozen encoder needs a full 6-frame context window (not a single frame) to encode anything, the target for future step `t+k` is a proper re-encoded 6-frame window ending at `t+k` — turns out context (`t-5..t`) + rollout targets (`t+1..t+6`) from a standard batch already span exactly the 12 consecutive frames needed for all 6 sliding windows, no dataloader change required.
+
+**Result (broad8, `complex_operator`, killed at epoch 6/7): plateaued hard.** Decoded vrmse (computed only for comparison, not part of the training loss) went 12.14 → 11.43 → 11.48 → 11.27 → 11.41 across epochs 1-5 — real early progress, then stuck, 4 straight epochs with no further improvement. Compare to any joint-trained model's 0.2-0.6 range: roughly 20-50x worse. Killed before completion — this reads as a settled negative result for "pure latent-space loss, frozen pretrained encoder/decoder, complex_operator" specifically, not proof against JEPA-style training in general (a fine-tuned or differently-regularized encoder, a different loss form, or a different operator architecture might behave completely differently — untried).
+
+## 6. Generalizing beyond rayleigh_benard: active_matter and shear_flow
+
+**Motivation**: two more Well datasets, `active_matter` and `shear_flow`, were already downloaded locally but ~40% of both was corrupted (truncated incomplete downloads, confirmed via direct HDF5-open checks — 32/82 and 37/84 files respectively). Root cause: `the-well-download`'s underlying `curl --continue-at -` resume mechanism, interrupted mid-batch at some earlier point and never rerun to completion. Simply re-running the same download command (`the-well-download --dataset <name> --base-path /home/sl8rv`) resumed/completed every file correctly — both datasets are now 100% valid (82/82, 84/84).
+
+**Real structural differences from rayleigh_benard, confirmed by direct HDF5 inspection, not assumed from filenames:**
+- `shear_flow`: pressure + tracer (2 scalars) + velocity (vector) = 4 channels, same shape family as rayleigh_benard (just tracer instead of buoyancy) — close to a drop-in fit. Grid 256x512 (double RB's Y-resolution).
+- `active_matter`: concentration (1 scalar) + velocity (vector) + **D, E (two rank-2 tensor fields, 2x2 each)** = 11 raw channels, no pressure field at all. Grid 256x256 (**square** — a real problem, see below). 3 params (L constant, zeta, alpha — alpha negative).
+
+**Generalized the dataloader (`field_spec` mechanism)**: replaced hardcoded pressure/buoyancy/velocity HDF5 keys with an ordered list of `{key, n_components}` specs (1=scalar, 2=vector, 4=flattened 2x2 tensor, row-major). One unified `_field_to_t_c_yx` helper subsumes the old separate scalar/vector-only logic and extends naturally to tensor fields. **Regression-tested bit-for-bit against the old rayleigh_benard code path** before trusting the generalization on new data.
+
+**Bug found and fixed: axis inference was length-based, ambiguous on `active_matter`'s square grid.** The old `_infer_xy_axes_from_shape` matched axes by comparing their length to `dimensions/x`/`dimensions/y` — works when x_len≠y_len (rayleigh_benard, shear_flow) but is fundamentally ambiguous when they're equal (`active_matter`'s 256x256). Switched to a position-based convention (x,y always axes 1,2, confirmed true across all three datasets' actual on-disk shape), with length used only as a sanity check where unambiguous.
+
+**Bug found and fixed: param reading switched from filename regex to reading `simulation_parameters` out of each file's own HDF5 attrs** — dataset-agnostic (works identically for rayleigh_benard's 2 params, shear_flow's 2, active_matter's 3), no per-dataset regex. This is strictly more general, but introduced a real regression: comparing the resulting float32-precision values against human-written JSON combos via exact tuple equality silently dropped any combo with a decimal that isn't exactly binary-representable (`float32(0.1)` upcast to float64 ≠ Python's `0.1` literal) — caught empirically when a `shear_flow` `--param-subset` request for 8 combos silently returned only 6. **Fixed** with a significant-figure-rounded match key (`_params_match_key`, 6 sig figs) used only for matching; the actual conditioning values fed to the model stay at full stored precision. Confirmed fixed: same 8-combo request now matches all 8.
+
+**Decoder generalized**: `scalar_field_names` (replaces the fixed pressure+buoyancy pair when set — e.g. `["concentration"]` for active_matter, `["pressure", "tracer"]` for shear_flow) and `tensor_field_names` (one `Conv2d(hidden_dim, 4, kernel=1)` head per tensor field, same pattern as every other head, kept as 4 flat channels not reshaped to `(...,2,2)`). Both default to `None`/empty — every existing config/checkpoint unaffected. `zero_mean_pressure` only applies when `"pressure"` is literally in `scalar_field_names`, not assumed for an arbitrary scalar. Confirmed via direct forward+backward checks (not just shape checks) that: gradients reach every new head, `zero_mean_pressure` correctly zeros only the pressure channel's spatial mean (~1e-9) while leaving other scalars unconstrained, and the streamfunction-derived-velocity path works correctly when combined with the new generalized `scalar_field_names` branch (previously only exercised via the old fixed-FieldState path).
+
+**Param encoder generalized**: new `MultiParamEncoder`, N params each with an independently configurable transform (avoids `log10`-on-negative-`alpha` producing NaN — `active_matter` uses `identity` for all 3 params given the observed ranges; `shear_flow` uses `log10`/`log10` for Reynolds/Schmidt, both wide-multiplicative-range).
+
+**`use_streamfunction` chosen per-dataset on physical grounds, not by default**: on for `shear_flow` (classic incompressible viscous flow + passive scalar transport — Reynolds/Schmidt numbers are specifically incompressible-flow parameters, the divergence-free assumption is well-justified) and explicitly off for `active_matter` (an active-nematic/polar-fluid constitutive model where incompressibility isn't a given, avoided rather than assumed).
+
+**First real training runs:**
+- `active_matter_full` (all 45 train / 16 valid files, ctx6/roll6, `sequence_conv`+`film_helmholtz`+concentration/D/E heads): 0.567 → 0.449 → 0.470 → 0.458 over 4 epochs (stopped mid-epoch-5). Notably fast per-epoch (~15-20min) given the much smaller total dataset (44GB) than rayleigh_benard.
+- `shear_flow_broad8` (8-combo subset, same recipe as the rayleigh_benard broad8 runs, `use_streamfunction=True`): hit a real CUDA OOM at `batch=8` (30GB+, crashed) — shear_flow's 256x512 grid is double rayleigh_benard's Y-resolution at the same batch size, and early un-downsampled layers scale activation memory roughly with pixel count. Fixed by dropping to `batch=4`; running cleanly (~21GB) as of this entry.
+
+## 7. Open threads
+
+- `shear_flow_broad8`'s actual results aren't in yet (just launched, corrected batch size).
+- `active_matter_full`/`shear_flow_broad8` numbers aren't comparable to rayleigh_benard's or to each other — different physical systems, different channel compositions, no shared baseline to compare against yet. Worth an autoencoder-pretraining pass (§4's method) on each to get their own reconstruction-floor reference points, once there's time.
+- §5's JEPA result is only a negative result for one specific setup (frozen encoder, `complex_operator`, pure latent MSE) — fine-tuning the encoder under the JEPA loss (with a stop-gradient/EMA target to prevent collapse) or a different loss form were both explicitly deferred, not tried.
+- §2's `fused_spectral_encoder_big`'s ~22x param increase bought only a marginal quality improvement (0.216→0.211) — consistent with §4's ceiling finding, but the decoder and operator have the same cheap-scaling levers (wider depthwise kernel, locally-connected untying) available and completely untried.
+- None of §2-5's architecture variants (FFT-fed encoders, full conditioning, autoencoder pretraining, JEPA) have been tried on `active_matter`/`shear_flow` yet — everything there so far is the simplest possible baseline choice at every layer, deliberately, as a first correctness/wiring test rather than an architecture decision.
+- `active_matter`'s tensor fields (D, E) have no dedicated loss weighting or physics-consistency diagnostic yet — `well_style_vrmse`'s generic per-channel variance normalization treats all 11 channels uniformly, untested whether that's actually reasonable for a rank-2 tensor field's own variance structure.
+- The legacy `sequence_conv`+`film_helmholtz` checkpoints from before this session (§1, ~0.225 best) were never reconciled with any of this session's numbers — different encoder entirely, no direct comparison attempted.
+
+---
+
+*`scripts` (well, `src/niko/training/`, `src/niko/eval/`) — `train.py` · `train_autoencoder_baseline.py` · `train_jepa_operator.py` · `eval_rb_checkpoint.py` · `probe_rb_checkpoint.py` — all runs via Docker*

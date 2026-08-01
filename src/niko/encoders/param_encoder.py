@@ -107,3 +107,26 @@ class RBParamEncoder(PerParamEncoder):
             ),
         ]
         super().__init__(heads=heads, target_dim=cond_dim, h_dim=h_dim)
+
+
+class MultiParamEncoder(PerParamEncoder):
+    """Generalizes RBParamEncoder to an arbitrary number of scalar params,
+    each with its own configurable transform -- e.g. active_matter's 3 params
+    (L, zeta, alpha): alpha is negative (rules out plain log10, which NaNs on
+    negative input), and L is constant across the whole dataset (harmless to
+    include as just another param -- a per-param linear head fed a constant
+    input reduces to a learned bias term, no special-casing needed to detect
+    and exclude "doesn't actually vary" params).
+    """
+
+    def __init__(self, cond_dim: int, h_dim: int, transforms: list[str]):
+        n = len(transforms)
+        if n == 0:
+            raise ValueError("MultiParamEncoder requires at least one transform.")
+        head_hdim = max(1, h_dim // n)
+        head_cond_dim = max(1, cond_dim // n)
+        heads = [
+            ScalarParamHead(target_dim=head_cond_dim, h_dim=head_hdim, transform=t)
+            for t in transforms
+        ]
+        super().__init__(heads=heads, target_dim=cond_dim, h_dim=h_dim)

@@ -16,11 +16,11 @@ class TransportOperator(OperatorBase):
         "advection": lambda latent_dim, hidden_dim, cond_dim, film:
             AdvectionTerm(latent_dim, hidden_dim, cond_dim, film=film),
         "diffusion": lambda latent_dim, hidden_dim, cond_dim, film:
-            DiffusionTerm(),
+            DiffusionTerm(cond_dim),
         "forcing": lambda latent_dim, hidden_dim, cond_dim, film:
             ForcingTerm(latent_dim, hidden_dim, cond_dim, film=film),
         "skew": lambda latent_dim, hidden_dim, cond_dim, film:
-            SkewTerm(latent_dim),
+            SkewTerm(latent_dim, cond_dim),
     }
 
     def __init__(

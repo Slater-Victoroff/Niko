@@ -1,7 +1,7 @@
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-import re
 from collections import OrderedDict, defaultdict
 
 import h5py
@@ -18,6 +18,34 @@ STACK_FRAMES_REMOVED_ERROR = (
     "stack_frames has been removed for Rayleigh-Benard training because it created invalid "
     "velocity-pair channels. Use physical channels [pressure, buoyancy, velocity_x, velocity_y]."
 )
+
+# A field_spec is an ordered list of {"key": <hdf5 dataset path>, "n_components": <int>}
+# describing which datasets to load and stack into channels. n_components=1 for a scalar
+# (t0_fields/*), 2 for a vector (t1_fields/*), 4 for a flattened 2x2 tensor (t2_fields/*,
+# row-major: T_00,T_01,T_10,T_11) -- generalizes the same channel-stacking pipeline across
+# every field rank The Well's format uses, not just RB's fixed 4-channel case.
+RB_FIELD_SPEC = [
+    {"key": "t0_fields/pressure", "n_components": 1},
+    {"key": "t0_fields/buoyancy", "n_components": 1},
+    {"key": "t1_fields/velocity", "n_components": 2},
+]
+
+ACTIVE_MATTER_FIELD_SPEC = [
+    {"key": "t0_fields/concentration", "n_components": 1},
+    {"key": "t1_fields/velocity", "n_components": 2},
+    {"key": "t2_fields/D", "n_components": 4},
+    {"key": "t2_fields/E", "n_components": 4},
+]
+
+SHEAR_FLOW_FIELD_SPEC = [
+    {"key": "t0_fields/pressure", "n_components": 1},
+    {"key": "t0_fields/tracer", "n_components": 1},
+    {"key": "t1_fields/velocity", "n_components": 2},
+]
+
+
+def field_spec_channels(field_spec: List[Dict[str, Any]]) -> int:
+    return sum(spec["n_components"] for spec in field_spec)
 
 
 @dataclass(frozen=True)
@@ -37,33 +65,30 @@ def _infer_xy_axes_from_shape(
     y_len: Optional[int],
     context_label: str,
 ) -> Tuple[int, int]:
-    """Infer x/y axes in a trajectory tensor based on dimensions/x and dimensions/y lengths.
+    """X and Y are always the two axes immediately after time (positions 1, 2) in every
+    Well-format dataset's trajectory-level layout (time axis already dropped here) -- any
+    extra trailing axes (vector component, tensor row/col) come after. Confirmed by
+    inspecting the actual on-disk shape of all three datasets in this project
+    (rayleigh_benard, shear_flow, active_matter): position, not length, is what's fixed.
 
-    The time axis must be axis 0. This helper only infers spatial axes for axis positions >= 1.
+    Length-matching is used only as a sanity check when x_len != y_len (unambiguous);
+    skipped when they're equal (e.g. active_matter's square 256x256 grid), where length
+    alone genuinely can't distinguish which is which -- matching by length there is not
+    just unnecessary, it would raise (multiple axes tie), which is what motivated this
+    switch from length-based inference to position-based in the first place.
     """
     if len(traj_shape) < 3:
         raise ValueError(f"{context_label} must have at least 3 dims (T + 2 spatial). Got shape={traj_shape}")
 
-    if x_len is None or y_len is None:
-        raise ValueError(
-            f"Cannot infer axis order for {context_label}: missing dimensions/x or dimensions/y in HDF5 file."
-        )
+    x_axis, y_axis = 1, 2
 
-    x_axes = [ax for ax in range(1, len(traj_shape)) if traj_shape[ax] == x_len]
-    y_axes = [ax for ax in range(1, len(traj_shape)) if traj_shape[ax] == y_len]
-
-    if len(x_axes) != 1 or len(y_axes) != 1:
-        raise ValueError(
-            f"Could not uniquely infer x/y axes for {context_label} with shape={traj_shape}, "
-            f"x_len={x_len}, y_len={y_len}, x_axes={x_axes}, y_axes={y_axes}."
-        )
-
-    x_axis = x_axes[0]
-    y_axis = y_axes[0]
-    if x_axis == y_axis:
-        raise ValueError(
-            f"Inferred same axis for x and y in {context_label}: axis={x_axis}, shape={traj_shape}."
-        )
+    if x_len is not None and y_len is not None and x_len != y_len:
+        if traj_shape[x_axis] != x_len or traj_shape[y_axis] != y_len:
+            raise ValueError(
+                f"Axis layout mismatch for {context_label}: expected positions (1, 2) to be "
+                f"(x_len={x_len}, y_len={y_len}) per the fixed Well-format convention, "
+                f"got shape={traj_shape}."
+            )
 
     return x_axis, y_axis
 
@@ -183,12 +208,18 @@ def inspect_rayleigh_benard_h5(
 
 
 class H5RayleighBenardFields(Dataset):
+    """Despite the name (kept for backward compatibility with existing call
+    sites), this class is dataset-agnostic: which HDF5 datasets to load and
+    how to stack them into channels is entirely driven by `field_spec` (see
+    RB_FIELD_SPEC/ACTIVE_MATTER_FIELD_SPEC/SHEAR_FLOW_FIELD_SPEC above).
+    Defaults to RB_FIELD_SPEC, so every existing call site that doesn't pass
+    field_spec explicitly keeps its exact current behavior.
+    """
+
     def __init__(
         self,
         filepaths: List[str],
-        pressure_key: str = "t0_fields/pressure",
-        buoyancy_key: str = "t0_fields/buoyancy",
-        velocity_key: str = "t1_fields/velocity",
+        field_spec: Optional[List[Dict[str, Any]]] = None,
         file_limit: Optional[int] = None,
         traj_limit: Optional[int] = None,
         dtype: torch.dtype = torch.float32,
@@ -205,9 +236,8 @@ class H5RayleighBenardFields(Dataset):
         if "stack_frames" in legacy_kwargs:
             raise ValueError(STACK_FRAMES_REMOVED_ERROR)
 
-        self.pressure_key = pressure_key
-        self.buoyancy_key = buoyancy_key
-        self.velocity_key = velocity_key
+        self.field_spec = field_spec if field_spec is not None else RB_FIELD_SPEC
+        self.n_channels = field_spec_channels(self.field_spec)
         self.dtype = dtype
         self.cache_mode = cache_mode
         self.transform = transform
@@ -216,7 +246,8 @@ class H5RayleighBenardFields(Dataset):
         self.predict_frames = int(predict_frames)
         self.device = torch.device(device) if device is not None else None
         self.traj_cache_capacity = max(1, int(traj_cache_capacity))
-        # optional per-file params (rayleigh, prandtl) parallel to `filepaths`
+        # optional per-file params (e.g. rayleigh/prandtl, or reynolds/schmidt,
+        # or L/zeta/alpha -- whatever field_spec's dataset uses) parallel to `filepaths`
         self.file_params = file_params
         self.return_params = bool(return_params)
 
@@ -245,63 +276,49 @@ class H5RayleighBenardFields(Dataset):
 
         self._open_file_idx: Optional[int] = None
         self._h5: Optional[h5py.File] = None
-        self._pressure_dset = None
-        self._buoyancy_dset = None
-        self._velocity_dset = None
+        self._dsets: Optional[List[Any]] = None
         self._traj_cache: "OrderedDict[Tuple[int, int], torch.Tensor]" = OrderedDict()
         self._traj_cache_hits = 0
         self._traj_cache_misses = 0
 
     def _inspect_layout(self, f: h5py.File, path: str) -> Dict[str, Any]:
-        for key in (self.pressure_key, self.buoyancy_key, self.velocity_key, "dimensions/x", "dimensions/y"):
+        for spec in self.field_spec:
+            if spec["key"] not in f:
+                raise KeyError(f"Missing required key '{spec['key']}' in {path}")
+        for key in ("dimensions/x", "dimensions/y"):
             if key not in f:
                 raise KeyError(f"Missing required key '{key}' in {path}")
 
-        pressure_shape = tuple(f[self.pressure_key].shape)
-        buoyancy_shape = tuple(f[self.buoyancy_key].shape)
-        velocity_shape = tuple(f[self.velocity_key].shape)
-
-        if len(pressure_shape) != 4:
-            raise ValueError(
-                f"Expected pressure dataset '{self.pressure_key}' to be 4D (N,T,*,*). "
-                f"Got shape={pressure_shape} in {path}"
-            )
-        if len(buoyancy_shape) != 4:
-            raise ValueError(
-                f"Expected buoyancy dataset '{self.buoyancy_key}' to be 4D (N,T,*,*). "
-                f"Got shape={buoyancy_shape} in {path}"
-            )
-        if len(velocity_shape) != 5:
-            raise ValueError(
-                f"Expected velocity dataset '{self.velocity_key}' to be 5D (N,T,*,*,2). "
-                f"Got shape={velocity_shape} in {path}"
-            )
-
-        if pressure_shape[:2] != buoyancy_shape[:2] or pressure_shape[:2] != velocity_shape[:2]:
-            raise ValueError(
-                "Trajectory/time dimensions mismatch among RB fields: "
-                f"pressure={pressure_shape}, buoyancy={buoyancy_shape}, velocity={velocity_shape} in {path}"
-            )
-
-        n_traj = int(pressure_shape[0])
-        time_steps = int(pressure_shape[1])
         x_len = int(f["dimensions/x"].shape[0])
         y_len = int(f["dimensions/y"].shape[0])
 
-        p_traj_shape = pressure_shape[1:]
-        b_traj_shape = buoyancy_shape[1:]
-        v_traj_shape = velocity_shape[1:]
+        n_traj = None
+        time_steps = None
+        field_layouts = []
+        for spec in self.field_spec:
+            shape = tuple(f[spec["key"]].shape)
+            # (N, T, *spatial*, *components*) -- components: none for scalar (n_components=1),
+            # one size-2 axis for vector (n_components=2), two size-2 axes for a tensor (n_components=4).
+            n_comp_axes = 0 if spec["n_components"] == 1 else (1 if spec["n_components"] == 2 else 2)
+            expected_ndim = 2 + 2 + n_comp_axes  # N, T, x, y, [components...]
+            if len(shape) != expected_ndim:
+                raise ValueError(
+                    f"Expected dataset '{spec['key']}' (n_components={spec['n_components']}) to be "
+                    f"{expected_ndim}D (N,T,*,*{',2'*n_comp_axes}). Got shape={shape} in {path}"
+                )
 
-        p_x_axis, p_y_axis = _infer_xy_axes_from_shape(p_traj_shape, x_len, y_len, "pressure trajectory")
-        b_x_axis, b_y_axis = _infer_xy_axes_from_shape(b_traj_shape, x_len, y_len, "buoyancy trajectory")
-        v_x_axis, v_y_axis = _infer_xy_axes_from_shape(v_traj_shape, x_len, y_len, "velocity trajectory")
+            if n_traj is None:
+                n_traj, time_steps = int(shape[0]), int(shape[1])
+            elif shape[0] != n_traj or shape[1] != time_steps:
+                raise ValueError(
+                    f"Trajectory/time dimensions mismatch for '{spec['key']}': "
+                    f"expected (N={n_traj}, T={time_steps}), got shape={shape} in {path}"
+                )
 
-        v_comp_axes = [ax for ax in range(1, len(v_traj_shape)) if v_traj_shape[ax] == 2]
-        if len(v_comp_axes) != 1:
-            raise ValueError(
-                f"Could not uniquely infer velocity component axis (size 2) from shape {v_traj_shape} in {path}."
-            )
-        v_comp_axis = v_comp_axes[0]
+            traj_shape = shape[1:]
+            x_axis, y_axis = _infer_xy_axes_from_shape(traj_shape, x_len, y_len, spec["key"])
+            field_layouts.append({"key": spec["key"], "shape": shape, "x_axis": x_axis, "y_axis": y_axis,
+                                   "n_components": spec["n_components"]})
 
         return {
             "path": path,
@@ -309,12 +326,7 @@ class H5RayleighBenardFields(Dataset):
             "time_steps": time_steps,
             "x_len": x_len,
             "y_len": y_len,
-            "pressure_shape": pressure_shape,
-            "buoyancy_shape": buoyancy_shape,
-            "velocity_shape": velocity_shape,
-            "pressure_axes": {"x": p_x_axis, "y": p_y_axis},
-            "buoyancy_axes": {"x": b_x_axis, "y": b_y_axis},
-            "velocity_axes": {"comp": v_comp_axis, "x": v_x_axis, "y": v_y_axis},
+            "fields": field_layouts,
         }
 
     def __len__(self) -> int:
@@ -332,52 +344,36 @@ class H5RayleighBenardFields(Dataset):
 
         path = self.files[file_idx]
         self._h5 = h5py.File(path, "r")
-        self._pressure_dset = self._h5[self.pressure_key]
-        self._buoyancy_dset = self._h5[self.buoyancy_key]
-        self._velocity_dset = self._h5[self.velocity_key]
+        self._dsets = [self._h5[spec["key"]] for spec in self.field_spec]
         self._open_file_idx = file_idx
 
-    def _scalar_to_tyx(self, arr: np.ndarray, x_axis: int, y_axis: int) -> np.ndarray:
-        # Input is trajectory-level scalar with time axis=0.
-        # Output must be (T, Y, X).
-        return np.moveaxis(arr, [y_axis, x_axis], [1, 2])
-
-    def _velocity_to_t2yx(self, arr: np.ndarray, comp_axis: int, x_axis: int, y_axis: int) -> np.ndarray:
-        # Input is trajectory-level velocity with time axis=0.
-        # Output must be (T, 2, Y, X).
-        return np.transpose(arr, (0, comp_axis, y_axis, x_axis))
+    def _field_to_t_c_yx(self, arr: np.ndarray, x_axis: int, y_axis: int, n_components: int) -> np.ndarray:
+        """arr: raw per-trajectory field, shape (T, ..., x_axis, y_axis, ...) with 0 or more
+        trailing 'component' axes beyond x/y (vector: one axis of size 2; tensor: two axes of
+        size 2 each). Returns (T, n_components, Y, X); any component axes are flattened in
+        their original relative order (tensor case: row-major, e.g. D_00,D_01,D_10,D_11) --
+        generalizes the old separate scalar/vector-only logic to any field rank.
+        """
+        remaining_axes = [ax for ax in range(arr.ndim) if ax not in (0, x_axis, y_axis)]
+        arr = np.moveaxis(arr, [y_axis, x_axis] + remaining_axes, [1, 2] + list(range(3, 3 + len(remaining_axes))))
+        T, Y, X = arr.shape[0], arr.shape[1], arr.shape[2]
+        arr = arr.reshape(T, Y, X, n_components)
+        return np.moveaxis(arr, 3, 1)  # -> (T, n_components, Y, X)
 
     def _get_traj_tensor(self, file_idx: int, traj_idx: int) -> torch.Tensor:
-        """Load one trajectory and convert to (T, 4, H, W) channel order [p,b,u,v]."""
-        assert self._pressure_dset is not None
-        assert self._buoyancy_dset is not None
-        assert self._velocity_dset is not None
+        """Load one trajectory and convert to (T, n_channels, H, W), channels in field_spec order."""
+        assert self._dsets is not None
 
         layout = self._layouts[file_idx]
+        arrays = []
+        for dset, field_layout in zip(self._dsets, layout["fields"]):
+            raw = np.asarray(dset[traj_idx, ...], dtype=np.float32)
+            arrays.append(self._field_to_t_c_yx(
+                raw, x_axis=field_layout["x_axis"], y_axis=field_layout["y_axis"],
+                n_components=field_layout["n_components"],
+            ))
 
-        p = np.asarray(self._pressure_dset[traj_idx, ...], dtype=np.float32)
-        b = np.asarray(self._buoyancy_dset[traj_idx, ...], dtype=np.float32)
-        v = np.asarray(self._velocity_dset[traj_idx, ...], dtype=np.float32)
-
-        p_tyx = self._scalar_to_tyx(
-            p,
-            x_axis=layout["pressure_axes"]["x"],
-            y_axis=layout["pressure_axes"]["y"],
-        )
-        b_tyx = self._scalar_to_tyx(
-            b,
-            x_axis=layout["buoyancy_axes"]["x"],
-            y_axis=layout["buoyancy_axes"]["y"],
-        )
-        v_t2yx = self._velocity_to_t2yx(
-            v,
-            comp_axis=layout["velocity_axes"]["comp"],
-            x_axis=layout["velocity_axes"]["x"],
-            y_axis=layout["velocity_axes"]["y"],
-        )
-
-        # [T, 4, H, W] with channel order [pressure, buoyancy, velocity_x, velocity_y]
-        fields = np.concatenate([p_tyx[:, None, :, :], b_tyx[:, None, :, :], v_t2yx], axis=1)
+        fields = np.concatenate(arrays, axis=1)  # [T, n_channels, H, W]
         x = torch.from_numpy(np.ascontiguousarray(fields)).to(self.dtype)
         return x
 
@@ -427,8 +423,8 @@ class H5RayleighBenardFields(Dataset):
         C = self.context_frames
         P = self.predict_frames
 
-        ctx = traj[s : s + C]      # (C, 4, H, W)
-        tgt = traj[s + C : s + C + P]  # (P, 4, H, W)
+        ctx = traj[s : s + C]      # (C, n_channels, H, W)
+        tgt = traj[s + C : s + C + P]  # (P, n_channels, H, W)
 
         if self.transform is not None:
             ctx = torch.stack([self.transform(f) for f in ctx], dim=0)
@@ -437,14 +433,12 @@ class H5RayleighBenardFields(Dataset):
         # Loud shape/channel checks to prevent channel-semantic regressions.
         assert ctx.ndim == 4, f"ctx must be 4D [T, C, H, W]; got shape={tuple(ctx.shape)}"
         assert tgt.ndim == 4, f"tgt must be 4D [T, C, H, W]; got shape={tuple(tgt.shape)}"
-        assert ctx.shape[1] == 4, (
-            "ctx channel dimension must be 4 physical channels in order "
-            "[pressure, buoyancy, velocity_x, velocity_y]. "
+        assert ctx.shape[1] == self.n_channels, (
+            f"ctx channel dimension must be {self.n_channels} channels per field_spec. "
             f"Got shape={tuple(ctx.shape)}"
         )
-        assert tgt.shape[1] == 4, (
-            "tgt channel dimension must be 4 physical channels in order "
-            "[pressure, buoyancy, velocity_x, velocity_y]. "
+        assert tgt.shape[1] == self.n_channels, (
+            f"tgt channel dimension must be {self.n_channels} channels per field_spec. "
             f"Got shape={tuple(tgt.shape)}"
         )
 
@@ -479,30 +473,66 @@ class H5VelocityFramePairs(Dataset):
         )
 
 
-def _parse_params_from_filename(filename: str):
-    """Parse Rayleigh and Prandtl values from a filename.
-
-    Returns (rayleigh: float, prandtl: float) or None if not found.
+def _read_params_from_h5(path: str) -> Optional[tuple]:
+    """Read simulation parameter values directly from the HDF5 file itself --
+    every Well-format file self-describes its own varying parameters via
+    attrs['simulation_parameters'] (an ordered list of names) and a matching
+    scalars/<name> dataset per name. Dataset-agnostic by construction: this
+    reads rayleigh_benard's (Rayleigh, Prandtl), shear_flow's (Reynolds,
+    Schmidt), and active_matter's (L, zeta, alpha) identically, without a
+    per-dataset filename regex -- replaces the old Rayleigh/Prandtl-specific
+    filename parser, which had no way to generalize to a 3-parameter dataset
+    or different parameter names. Verified to return numerically identical
+    values to the old filename-regex approach for rayleigh_benard.
     """
-    # match numbers like: 1e10, 1e-1, 5e-1, 10, 2.5, etc., and ensure we stop before the .hdf5 extension
-    num = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+\-]?\d+)?"
-    pattern = rf"Rayleigh_({num})_Prandtl_({num})\.hdf5$"
-    m = re.search(pattern, filename, flags=re.I)
-    if not m:
-        return None
     try:
-        r = float(m.group(1))
-        p = float(m.group(2))
-        return (r, p)
+        with h5py.File(path, "r") as f:
+            names = f.attrs.get("simulation_parameters")
+            if names is None:
+                return None
+            values = []
+            for name in names:
+                key = f"scalars/{name}"
+                if key not in f:
+                    return None
+                values.append(float(f[key][()]))
+            return tuple(values)
     except Exception:
         return None
+
+
+def _round_sig(x: float, sig: int = 6) -> float:
+    """Round to `sig` significant figures (not fixed decimal places -- params
+    here span both huge (Rayleigh ~1e10) and small (Prandtl 0.1) magnitudes,
+    so a fixed decimal-place round wouldn't work uniformly)."""
+    if x == 0:
+        return 0.0
+    return round(x, -int(math.floor(math.log10(abs(x)))) + (sig - 1))
+
+
+def _params_match_key(params: tuple, sig: int = 6) -> tuple:
+    """Matching key for comparing a requested --param-subset combo against a
+    file's actual params. Values here are stored as float32 in the HDF5 file
+    but a human-written JSON combo (e.g. 0.1) parses as an exact float64 --
+    float32(0.1) upcast to float64 is 0.10000000149011612, which does NOT
+    bit-match Python's 0.1 literal, so exact tuple equality silently drops
+    real matches for any decimal that isn't exactly binary-representable
+    (0.1, 0.2, 0.3, ... -- confirmed concretely: this dropped 2 of 8 requested
+    shear_flow combos before this fix). Rounding both sides to 6 significant
+    figures before comparing absorbs that float32-precision noise (~1e-7
+    relative) while still easily distinguishing any two genuinely different
+    parameter values in this project's datasets (which differ by orders of
+    magnitude or at least whole small-integer multiples, never anywhere near
+    1e-6 relative). Only used for matching -- the actual params fed to the
+    model as conditioning input stay at full stored precision.
+    """
+    return tuple(_round_sig(v, sig) for v in params)
 
 
 def _group_files_by_params(filepaths: List[str]) -> Dict[tuple, List[str]]:
     groups: Dict[tuple, List[str]] = defaultdict(list)
     for fp in filepaths:
-        fn = os.path.basename(fp)
-        parsed = _parse_params_from_filename(fn)
+        parsed = _read_params_from_h5(fp)
         if parsed is None:
             continue
         groups[parsed].append(fp)
@@ -729,6 +759,7 @@ def create_param_dataloaders(
     cache_mode: str = "traj",
     traj_cache_capacity: Optional[int] = None,
     block_size: int = 32,
+    field_spec: Optional[List[Dict[str, Any]]] = None,
     **legacy_kwargs,
 ) -> Tuple[DataLoader, DataLoader, Optional[tuple]]:
     if "stack_frames" in legacy_kwargs:
@@ -765,23 +796,24 @@ def create_param_dataloaders(
     # than one distinct combo may be present.
     chosen = None
     if param_choices:
-        wanted = {tuple(c) for c in param_choices}
-        train_files = [fp for fp in train_files_all
-                       if _parse_params_from_filename(os.path.basename(fp)) in wanted]
-        val_files = [fp for fp in valid_files_all
-                     if _parse_params_from_filename(os.path.basename(fp)) in wanted]
-        found = {_parse_params_from_filename(os.path.basename(fp)) for fp in train_files + val_files}
-        missing = wanted - found
+        wanted_keys = {_params_match_key(tuple(c)) for c in param_choices}
+        file_params_cache = {fp: _read_params_from_h5(fp) for fp in train_files_all + valid_files_all}
+
+        def _matches(fp):
+            p = file_params_cache[fp]
+            return p is not None and _params_match_key(p) in wanted_keys
+
+        train_files = [fp for fp in train_files_all if _matches(fp)]
+        val_files = [fp for fp in valid_files_all if _matches(fp)]
+        found_keys = {_params_match_key(file_params_cache[fp]) for fp in train_files + val_files}
+        missing = wanted_keys - found_keys
         if missing:
             print(f"[create_param_dataloaders] warning: no files found for combos {missing}")
-        print(f"[create_param_dataloaders] param_choices={sorted(wanted)} -> "
+        print(f"[create_param_dataloaders] param_choices={sorted(wanted_keys)} -> "
               f"{len(train_files)} train file(s), {len(val_files)} val file(s)")
 
-        def _params_for_list(lst):
-            return [_parse_params_from_filename(os.path.basename(fp)) for fp in lst]
-
-        train_file_params = _params_for_list(train_files)
-        val_file_params = _params_for_list(val_files)
+        train_file_params = [file_params_cache[fp] for fp in train_files]
+        val_file_params = [file_params_cache[fp] for fp in val_files]
     # prefer parameter pairs that exist in both train and valid when not using the full split
     elif not use_all_params:
         common_keys = set(train_groups.keys()) & set(valid_groups.keys())
@@ -798,7 +830,7 @@ def create_param_dataloaders(
         def _params_for_list(lst):
             out = []
             for fp in lst:
-                parsed = _parse_params_from_filename(os.path.basename(fp))
+                parsed = _read_params_from_h5(fp)
                 out.append(parsed)
             return out
 
@@ -807,6 +839,7 @@ def create_param_dataloaders(
 
     trainset = H5RayleighBenardFields(
         train_files,
+        field_spec=field_spec,
         file_limit=train_file_limit,
         context_frames=context_frames,
         predict_frames=predict_frames,
@@ -819,6 +852,7 @@ def create_param_dataloaders(
 
     valset = H5RayleighBenardFields(
         val_files,
+        field_spec=field_spec,
         file_limit=val_file_limit,
         context_frames=context_frames,
         predict_frames=predict_frames,
