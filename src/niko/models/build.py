@@ -1,9 +1,7 @@
 from encoders.param_encoder import RBParamEncoder, MultiParamEncoder
+from encoders.context_cond import ContextCondEncoder, PooledContextCondEncoder
 
 from encoders.sequence_conv import SequenceConvEncoder
-from encoders.split_encoder import (
-    SplitEncoder, FFTSplitEncoder, FFTSplitEncoderWide, FusedSpectralEncoder, FusedSpectralEncoderBig,
-)
 
 from operators.linear_local import LinearLocalOperator
 from operators.transport_operator import (
@@ -11,7 +9,6 @@ from operators.transport_operator import (
     HelmholtzTransportOperator,
     FiLMAdvectionDiffusionOperator,
     FiLMHelmholtzTransportOperator,
-    ComplexTransportOperator,
 )
 from operators.direct_field_operator import DirectFieldOperator
 
@@ -37,17 +34,27 @@ def build_param_encoder(cfg):
     return cls(**kwargs)
 
 
+def build_context_cond_encoder(cfg):
+    kwargs = dict(cfg)
+    name = kwargs.pop("name", "stacked")
+
+    context_cond_encoder_map = {
+        "stacked": ContextCondEncoder,
+        "pooled": PooledContextCondEncoder,
+    }
+
+    cls = context_cond_encoder_map.get(name)
+    if cls is None:
+        raise ValueError(f"Unknown context_cond_encoder: {name}")
+    return cls(**kwargs)
+
+
 def build_encoder(cfg):
     name = cfg.pop("name")
     kwargs = dict(cfg)
 
     encoder_map = {
         "sequence_conv": SequenceConvEncoder,
-        "split_encoder": SplitEncoder,
-        "split_encoder_fft": FFTSplitEncoder,
-        "split_encoder_fft_wide": FFTSplitEncoderWide,
-        "fused_spectral_encoder": FusedSpectralEncoder,
-        "fused_spectral_encoder_big": FusedSpectralEncoderBig,
     }
 
     cls = encoder_map.get(name)
@@ -66,7 +73,6 @@ def build_operator(cfg):
         "helmholtz_transport": HelmholtzTransportOperator,
         "film_advection_diffusion": FiLMAdvectionDiffusionOperator,
         "film_helmholtz": FiLMHelmholtzTransportOperator,
-        "complex_operator": ComplexTransportOperator,
     }
 
     cls = operator_map.get(name)
@@ -104,7 +110,15 @@ def build_model(cfg):
     if cfg.get("model_type") == "direct":
         return build_direct_model(cfg)
 
-    param_encoder = build_param_encoder(cfg["param_encoder"])
+    # context_cond_encoder (cond inferred from x_context) and param_encoder (cond from
+    # ground-truth Params) are mutually exclusive -- see LatentDynamicsModel's own check.
+    param_encoder = None
+    context_cond_encoder = None
+    if "context_cond_encoder" in cfg:
+        context_cond_encoder = build_context_cond_encoder(cfg["context_cond_encoder"])
+    else:
+        param_encoder = build_param_encoder(cfg["param_encoder"])
+
     encoder = build_encoder(cfg["encoder"])
     operator = build_operator(cfg["operator"])
     decoder = build_decoder(cfg["decoder"])
@@ -113,6 +127,7 @@ def build_model(cfg):
 
     return LatentDynamicsModel(
         param_encoder=param_encoder,
+        context_cond_encoder=context_cond_encoder,
         encoder=encoder,
         operator=operator,
         decoder=decoder,

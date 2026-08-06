@@ -1,0 +1,35 @@
+# Same encoder/operator/decoder as plain_helmholtz.yaml (the broad8/7-epoch
+# control, best valid_loss 0.229) -- the only thing that changes is where
+# `cond` comes from: instead of param_encoder(ground-truth Params), this uses
+# context_cond_encoder(x_context) (see encoders/context_cond.py). No 2-number
+# Rayleigh/Prandtl bottleneck at all -- cond_dim is used directly as the
+# fixed-size interconnect between context and the operator/decoder's FiLM
+# layers, trained fully jointly via the normal rollout/reconstruction loss.
+# No ground-truth params are used anywhere in this config.
+# rollout_steps and context_frames are passed as CLI args to train.py / eval scripts.
+anchor_target: true
+
+context_cond_encoder:
+  in_channels: 4
+  cond_dim: 32
+  hidden_dim: 64
+
+encoder:
+  name: sequence_conv
+  in_channels: 4
+  latent_dim: 16
+  hidden_dim: 64
+
+operator:
+  name: film_helmholtz
+  latent_dim: 16
+  hidden_dim: 64
+  cond_dim: 32
+
+decoder:
+  name: shared_heads
+  latent_dim: 16
+  hidden_dim: 48
+  upsample: 2
+  zero_mean_pressure: true
+  use_streamfunction: true

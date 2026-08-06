@@ -38,13 +38,20 @@ def _tensor_summary(name: str, t: Optional[Tensor]) -> str:
 class LatentDynamicsModel(nn.Module):
     def __init__(
         self,
-        param_encoder: ParamEncoderBase,
         encoder: EncoderBase,
         operator: OperatorBase,
         decoder: DecoderBase,
+        param_encoder: Optional[ParamEncoderBase] = None,
+        context_cond_encoder: Optional[nn.Module] = None,
     ):
         super().__init__()
+        if (param_encoder is None) == (context_cond_encoder is None):
+            raise ValueError(
+                "LatentDynamicsModel requires exactly one of param_encoder (cond from ground-truth "
+                "Params) or context_cond_encoder (cond inferred directly from x_context), not both/neither."
+            )
         self.param_encoder = param_encoder
+        self.context_cond_encoder = context_cond_encoder
         self.encoder = encoder
         self.operator = operator
         self.decoder = decoder
@@ -53,7 +60,7 @@ class LatentDynamicsModel(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         # print overall and per-component parameter counts
-        component_names = ["param_encoder", "encoder", "operator", "decoder"]
+        component_names = ["param_encoder", "context_cond_encoder", "encoder", "operator", "decoder"]
         for name in component_names:
             m = getattr(self, name, None)
             if m is None:
@@ -98,7 +105,10 @@ class LatentDynamicsModel(nn.Module):
                     torch.cuda.synchronize()
                 timings[key] = time.perf_counter() - t0
 
-        cond = self.param_encoder(params)
+        if self.context_cond_encoder is not None:
+            cond = self.context_cond_encoder(x_context)
+        else:
+            cond = self.param_encoder(params)
         timings: dict[str, float] = {}
 
         # encoder

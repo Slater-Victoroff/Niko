@@ -83,7 +83,7 @@ class OperatorBase(ValidatedModule, nn.Module, ABC):
         cond: Optional[Tensor] = None,
     ) -> LatentState:
         raise NotImplementedError
-    
+
     def validate_input(self, z: LatentState, cond: Optional[Tensor] = None) -> None:
         assert isinstance(z, LatentState), f"Expected z to be a LatentState, got {type(z)}"
 

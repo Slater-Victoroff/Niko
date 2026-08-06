@@ -61,8 +61,11 @@ def train(
     # the actual expected count for whatever field_spec is configured, rather than this
     # function hardcoding RB's specific case.
     if not is_direct:
-        # Patch cfg before build_model so the encoder receives the correct context_frames.
+        # Patch cfg before build_model so the encoder (and context_cond_encoder, if
+        # configured in place of param_encoder) receive the correct context_frames.
         cfg["encoder"]["context_frames"] = T
+        if "context_cond_encoder" in cfg:
+            cfg["context_cond_encoder"]["context_frames"] = T
 
     cfg["rollout_steps"] = K
 

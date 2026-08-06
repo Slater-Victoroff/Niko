@@ -165,37 +165,3 @@ class SkewTerm(nn.Module):
         skew_raw = self.skew_head(cond).view(b, self.latent_dim, self.latent_dim)
         k = skew_raw - skew_raw.transpose(-1, -2)
         return torch.einsum("bij,bjhw->bihw", k, z.real_grid)
-
-
-class ComplexRotationTerm(nn.Module):
-    def __init__(self, latent_dim: int, hidden_dim: int, cond_dim: int):
-        super().__init__()
-        self.net = _conditioned_net(
-            2 * latent_dim,
-            hidden_dim=hidden_dim,
-            cond_dim=cond_dim,
-            out_channels=latent_dim,
-            in_kernel_size=1,
-            use_block=False,
-            film=True,
-        )
-
-    def forward(self, z: LatentState, cond: Tensor) -> Tensor:
-        return self.net(z.channel_sgrid, cond)  # real [B, latent_dim, H, W] phase angles
-
-
-class ComplexAmplitudeTerm(nn.Module):
-    def __init__(self, latent_dim: int, hidden_dim: int, cond_dim: int):
-        super().__init__()
-        self.net = _conditioned_net(
-            2 * latent_dim,
-            hidden_dim=hidden_dim,
-            cond_dim=cond_dim,
-            out_channels=latent_dim,
-            in_kernel_size=1,
-            use_block=False,
-            film=True,
-        )
-
-    def forward(self, z: LatentState, cond: Tensor) -> Tensor:
-        return self.net(z.channel_sgrid, cond)  # real [B, latent_dim, H, W] log-amplitude

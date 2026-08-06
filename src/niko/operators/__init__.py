@@ -3,7 +3,6 @@
 from .linear_local import LinearLocalOperator
 from .transport_terms import AdvectionTerm, DiffusionTerm, ForcingTerm, SkewTerm
 from .transport_operator import (
-    ComplexTransportOperator,
     AdvectionDiffusionOperator,
     HelmholtzTransportOperator,
     FiLMAdvectionDiffusionOperator,
@@ -16,7 +15,6 @@ __all__ = [
     "DiffusionTerm",
     "ForcingTerm",
     "SkewTerm",
-    "ComplexTransportOperator",
     "AdvectionDiffusionOperator",
     "HelmholtzTransportOperator",
     "FiLMAdvectionDiffusionOperator",
