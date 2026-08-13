@@ -1,0 +1,38 @@
+# shear_flow: structurally identical to rayleigh_benard's channel composition
+# (2 scalars + a vector field = 4 channels), just pressure+tracer instead of
+# pressure+buoyancy -- close to a drop-in fit for the existing architecture,
+# unlike active_matter's tensor fields. use_streamfunction=True is kept (unlike
+# active_matter.yaml, which deliberately left it off): Reynolds/Schmidt-number
+# flow is classic incompressible viscous flow + passive scalar transport, so
+# the divergence-free-velocity assumption is well-justified here, not just
+# carried over by convention from rayleigh_benard.
+# rollout_steps and context_frames are passed as CLI args to train.py / eval scripts.
+field_spec: shear_flow
+anchor_target: true
+
+param_encoder:
+  name: multi_param
+  cond_dim: 32
+  h_dim: 64
+  transforms: [log10, log10]  # Reynolds, Schmidt -- both span wide multiplicative ranges
+
+encoder:
+  name: sequence_conv
+  in_channels: 4
+  latent_dim: 16
+  hidden_dim: 64
+
+operator:
+  name: film_helmholtz
+  latent_dim: 16
+  hidden_dim: 64
+  cond_dim: 32
+
+decoder:
+  name: shared_heads
+  latent_dim: 16
+  hidden_dim: 48
+  upsample: 2
+  zero_mean_pressure: true
+  use_streamfunction: true
+  scalar_field_names: [pressure, tracer]

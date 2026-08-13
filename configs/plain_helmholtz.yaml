@@ -1,0 +1,33 @@
+# The genuinely plain baseline: no complex/fft branch, no tucker branch --
+# just SequenceConvEncoder (produces LatentState(real_grid=...) only) into
+# the full real Helmholtz operator (advection+diffusion+skew+forcing,
+# FiLM-conditioned) into shared_heads. Every broad8/7-epoch number logged so
+# far (0.211-0.290) is some encoder-branch variant on top of this; this is
+# the control none of them have actually been run against under the exact
+# same protocol.
+# rollout_steps and context_frames are passed as CLI args to train.py / eval scripts.
+anchor_target: true
+param_encoder:
+  name: rb_param
+  cond_dim: 32
+  h_dim: 64
+
+encoder:
+  name: sequence_conv
+  in_channels: 4
+  latent_dim: 16
+  hidden_dim: 64
+
+operator:
+  name: film_helmholtz
+  latent_dim: 16
+  hidden_dim: 64
+  cond_dim: 32
+
+decoder:
+  name: shared_heads
+  latent_dim: 16
+  hidden_dim: 48
+  upsample: 2
+  zero_mean_pressure: true
+  use_streamfunction: true

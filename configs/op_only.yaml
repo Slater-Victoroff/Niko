@@ -1,0 +1,13 @@
+model_type: direct
+anchor_target: false  # no encode/decode round-trip to anchor
+
+param_encoder:
+  name: rb_param
+  cond_dim: 32
+  h_dim: 64
+
+operator:
+  name: direct_field
+  hidden_dim: 64
+  depth: 8
+  cond_dim: 32
