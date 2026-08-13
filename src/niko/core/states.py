@@ -20,17 +20,39 @@ class Params:
 @dataclass
 class LatentState:
     real_grid: Optional[Tensor] = None
+    spectral_grid: Optional[Tensor] = None
     aux: Optional[Tensor] = None
     meta: Optional[Dict[str, Any]] = None
 
     @property
     def grid(self) -> Tensor:
-        if self.real_grid is None:
+        """Real_grid, fused with the complex branch (irfft2'd back to real
+        space and added) when a spectral_grid is present -- the one place
+        this fusion happens, so callers (decoder, rollout stacking) never
+        need to know whether a complex branch exists at all."""
+        if self.real_grid is None and self.spectral_grid is None:
             raise ValueError("LatentState has no grid data.")
+        if self.real_grid is not None and self.spectral_grid is not None:
+            return self.real_grid + torch.fft.irfft2(self.spectral_grid, s=self.real_grid.shape[-2:], norm="ortho")
         return self.real_grid
 
-    def replace_state(self, real_grid: Tensor) -> "LatentState":
-        return LatentState(real_grid=real_grid, aux=self.aux, meta=self.meta)
+    @property
+    def channel_sgrid(self) -> Tensor:
+        """spectral_grid's real/imag parts concatenated along the channel
+        dim -- a real-valued [B, 2*latent_dim, H, W] tensor, the input shape
+        a normal conv net expects. For terms that read (not evolve) the
+        current spectral content, e.g. predicting the next rotation angle."""
+        if self.spectral_grid is None:
+            raise ValueError("LatentState has no spectral_grid data.")
+        return torch.cat([self.spectral_grid.real, self.spectral_grid.imag], dim=1)
+
+    def replace_state(self, real_grid: Tensor, spectral_grid: Optional[Tensor] = None) -> "LatentState":
+        return LatentState(
+            real_grid=real_grid,
+            spectral_grid=spectral_grid if spectral_grid is not None else self.spectral_grid,
+            aux=self.aux,
+            meta=self.meta,
+        )
 
 
 @dataclass

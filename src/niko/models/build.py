@@ -1,14 +1,17 @@
 from encoders.param_encoder import RBParamEncoder, MultiParamEncoder
-from encoders.context_cond import ContextCondEncoder, PooledContextCondEncoder
+from encoders.context_cond import ContextCondEncoder, PooledContextCondEncoder, LatentContextCondEncoder
 
 from encoders.sequence_conv import SequenceConvEncoder
 
 from operators.linear_local import LinearLocalOperator
 from operators.transport_operator import (
+    TransportOperator,
     AdvectionDiffusionOperator,
     HelmholtzTransportOperator,
+    LocalAttentionTransportOperator,
     FiLMAdvectionDiffusionOperator,
     FiLMHelmholtzTransportOperator,
+    FiLMLocalAttentionTransportOperator,
 )
 from operators.direct_field_operator import DirectFieldOperator
 
@@ -41,6 +44,7 @@ def build_context_cond_encoder(cfg):
     context_cond_encoder_map = {
         "stacked": ContextCondEncoder,
         "pooled": PooledContextCondEncoder,
+        "latent_pooled": LatentContextCondEncoder,
     }
 
     cls = context_cond_encoder_map.get(name)
@@ -69,10 +73,13 @@ def build_operator(cfg):
 
     operator_map = {
         "linear_local": LinearLocalOperator,
+        "transport": TransportOperator,
         "advection_diffusion": AdvectionDiffusionOperator,
         "helmholtz_transport": HelmholtzTransportOperator,
+        "local_attention_transport": LocalAttentionTransportOperator,
         "film_advection_diffusion": FiLMAdvectionDiffusionOperator,
         "film_helmholtz": FiLMHelmholtzTransportOperator,
+        "film_local_attention": FiLMLocalAttentionTransportOperator,
     }
 
     cls = operator_map.get(name)
