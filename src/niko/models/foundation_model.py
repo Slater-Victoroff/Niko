@@ -114,6 +114,25 @@ class FoundationModel(nn.Module):
             preds.append(z)
         return preds
 
+    @staticmethod
+    def _broadcast_cond_bc(cond: Tensor, bc_weights: Optional[tuple], B: int, N: int):
+        """cond/bc_weights are one-per-sample ([B, ...]); every per-position call this
+        class makes (N rollout steps in forward(), N dense-single-step pairs in
+        forward_dense_singlestep()) needs the SAME cond/bc_weights repeated across
+        that position axis before flattening position into the batch dim for a
+        single decoder/operator call. Shared here so both call sites can't drift
+        apart on this broadcasting logic."""
+        cond_flat = cond[:, None, :].expand(B, N, cond.shape[-1]).reshape(B * N, cond.shape[-1])
+        if bc_weights is not None:
+            wx, wy = bc_weights
+            bc_weights_flat = (
+                wx[:, None, :].expand(B, N, 3).reshape(B * N, 3),
+                wy[:, None, :].expand(B, N, 3).reshape(B * N, 3),
+            )
+        else:
+            bc_weights_flat = None
+        return cond_flat, bc_weights_flat
+
     def forward(
         self,
         x_context_raw: Tensor,
@@ -146,15 +165,7 @@ class FoundationModel(nn.Module):
         zs_stacked = torch.stack([z.grid for z in zs], dim=1)
         B, T = zs_stacked.shape[:2]
         zs_flat = zs_stacked.reshape(B * T, *zs_stacked.shape[2:])
-        cond_flat = cond[:, None, :].expand(B, T, cond.shape[-1]).reshape(B * T, cond.shape[-1])
-        if bc_weights is not None:
-            wx, wy = bc_weights
-            bc_weights_flat = (
-                wx[:, None, :].expand(B, T, 3).reshape(B * T, 3),
-                wy[:, None, :].expand(B, T, 3).reshape(B * T, 3),
-            )
-        else:
-            bc_weights_flat = None
+        cond_flat, bc_weights_flat = self._broadcast_cond_bc(cond, bc_weights, B, T)
         response_flat = decoder(zs_flat, cond=cond_flat, bc_weights=bc_weights_flat)
         response = response_flat.reshape(B, T, *response_flat.shape[1:])
 
@@ -172,3 +183,83 @@ class FoundationModel(nn.Module):
         if return_latents:
             return (*result, zs) if isinstance(result, tuple) else (result, zs)
         return result
+
+    def forward_dense_singlestep(
+        self,
+        x_context_raw: Tensor,
+        x_target_raw: Tensor,
+        field_spec: List[dict],
+        task: str,
+        n_substeps: int = 1,
+    ) -> tuple:
+        """Decouples "how much context informs cond" from "how many single-step
+        training pairs one window yields" -- context_cond_encoder still pools the
+        FULL context window (context_frames=T, e.g. 16) for a well-informed cond
+        ("tighter bound on the operator"), but self.encoder here must be a
+        SEPARATELY built module with encoder_context_frames=1 (see
+        build_foundation_model's encoder_context_frames), since it's applied to
+        one raw frame at a time, not the T-frame-stacked input self.encoder gets
+        in forward(). Every consecutive pair inside the T-context + K-target
+        window becomes its own directly-supervised single-step example (T+K-1 of
+        them, e.g. 16 when T=16/K=1) instead of only supervising the one final
+        transition -- reuses exactly the same (T-frame-context, K-frame-target)
+        batch train_foundation.py's dataloaders already produce; no new
+        windowing/data-loading logic needed, just consuming the raw frames that
+        were already being loaded and only partially used.
+
+        Motivated by a real, measured result (see EXPERIMENT_LOG.md and this
+        session's per-step vrmse breakdown): a K-step-averaged rollout's own
+        early steps are meaningfully better than its later ones (compounding
+        rollout error), and a model trained head-on for single-step prediction
+        (ctx1/roll1) does noticeably better at t+1 specifically than the same
+        architecture getting t+1 "for free" from a longer-context/longer-rollout
+        model -- but ctx1 also throws away everything a longer context window
+        could have told the model about which physical regime it's in. This
+        keeps the long-context conditioning benefit while still training
+        head-on for single-step accuracy at every available transition, not
+        just the final one.
+
+        Returns (pred, target_raw), both [B, T+K-1, C_raw, H, W] -- callers
+        compute their own loss the same way every other call site here does,
+        typically well_style_vrmse(pred, target_raw).mean().
+        """
+        if task not in self.decoders:
+            raise ValueError(f"Unknown task '{task}'; known tasks: {list(self.decoders.keys())}")
+
+        x_context = self.field_embedder(x_context_raw, field_spec, task)  # [B, T, canonical_dim, H, W]
+        x_target = self.field_embedder(x_target_raw, field_spec, task)  # [B, K, canonical_dim, H, W]
+        cond = self.context_cond_encoder(x_context)  # from the FULL context window, same as forward()
+        bc_weights = self.boundary_geometry(x_context, task) if self.boundary_geometry is not None else None
+
+        all_canonical = torch.cat([x_context, x_target], dim=1)  # [B, T+K, canonical_dim, H, W]
+        all_raw = torch.cat([x_context_raw, x_target_raw], dim=1)  # [B, T+K, C_raw, H, W]
+        B, TK = all_canonical.shape[:2]
+        N = TK - 1  # number of consecutive (frame_i, frame_{i+1}) pairs available in this window
+
+        # Fold position N into the batch dim -- one encoder/operator/decoder call
+        # covers every position at once, same "flatten position, run once, reshape
+        # back" idiom forward() already uses for its K rollout-step decode.
+        inputs_flat = all_canonical[:, :N].reshape(B * N, 1, *all_canonical.shape[2:])
+        z0_flat = self.encoder(inputs_flat)  # encoder built with context_frames=1 -- see docstring
+        cond_flat, bc_weights_flat = self._broadcast_cond_bc(cond, bc_weights, B, N)
+
+        if self.complex_proj is not None:
+            # forward()'s equivalent step uses the LAST frame of a multi-frame context
+            # as complex_proj's source; here every position only ever has its own
+            # single frame, so that frame IS the natural per-position analog.
+            frame_flat = inputs_flat[:, 0]  # [B*N, canonical_dim, H, W]
+            spec = rfft2_crop(frame_flat, out_h=z0_flat.real_grid.shape[-2], out_w=z0_flat.real_grid.shape[-1])
+            spec_ri = torch.cat([spec.real, spec.imag], dim=1)
+            proj = self.complex_proj(spec_ri)
+            re, im = proj.chunk(2, dim=1)
+            z0_flat = z0_flat.replace_state(real_grid=z0_flat.real_grid, spectral_grid=torch.complex(re, im))
+
+        dt = 1.0 / n_substeps
+        z1_flat = z0_flat
+        for _ in range(n_substeps):
+            z1_flat = self.operator(z1_flat, cond=cond_flat, bc_weights=bc_weights_flat, dt=dt)
+
+        pred_flat = self.decoders[task](z1_flat.grid, cond=cond_flat, bc_weights=bc_weights_flat)
+        pred = pred_flat.reshape(B, N, *pred_flat.shape[1:])
+        target_raw = all_raw[:, 1:TK]  # each position's own immediate next frame
+        return pred, target_raw

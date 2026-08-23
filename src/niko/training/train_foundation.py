@@ -468,13 +468,26 @@ def build_foundation_model(model_config: dict, device) -> FoundationModel:
     {"field_spec": ..., "decoder_kwargs": ...} -- just the two fields needed to
     rebuild the architecture, not the full build_tasks() config with data-loading-
     specific keys like batch/traj_limit/data_dir that eval doesn't need).
+
+    encoder_context_frames (optional, defaults to context_frames): lets `encoder`
+    be built with a DIFFERENT context length than context_cond_encoder --
+    normally these match (both see the same T-frame context, forward()'s usual
+    path), but FoundationModel.forward_dense_singlestep needs encoder built with
+    encoder_context_frames=1 (single-frame encode) while context_cond_encoder
+    still pools the full context_frames window for cond. See that method's
+    docstring for why this split exists.
     """
     mc = model_config
     T = mc["context_frames"]
+    encoder_T = mc.get("encoder_context_frames", T)
     # .get with the pre-existing default: old checkpoints/model_configs saved
     # before this key existed still load unchanged (every prior checkpoint was
     # built with kernel_size=7 everywhere, ConvNeXtBlock's own default).
     block_kernel_size = mc.get("block_kernel_size", 7)
+    # Same backward-compat pattern: checkpoints saved before --operator-terms
+    # existed were always built with this exact hardcoded tuple (see
+    # --operator-terms' own help text) -- .get so those old checkpoints still load.
+    operator_terms = mc.get("operator_terms", ["advection", "diffusion", "skew", "forcing"])
 
     field_embedder = FieldEmbedder(mc["tasks"], canonical_dim=mc["canonical_dim"]).to(device)
     boundary_geometry = (
@@ -486,12 +499,12 @@ def build_foundation_model(model_config: dict, device) -> FoundationModel:
         hidden_dim=mc["context_cond_hidden_dim"],
     ).to(device)
     encoder = SequenceConvEncoder(
-        in_channels=mc["canonical_dim"], context_frames=T, latent_dim=mc["latent_dim"], hidden_dim=mc["hidden_dim"],
+        in_channels=mc["canonical_dim"], context_frames=encoder_T, latent_dim=mc["latent_dim"], hidden_dim=mc["hidden_dim"],
         block_kernel_size=block_kernel_size,
     ).to(device)
     operator = TransportOperator(
         latent_dim=mc["latent_dim"], hidden_dim=mc["hidden_dim"], cond_dim=mc["cond_dim"],
-        terms=tuple(mc["operator_terms"]), film=True,
+        terms=tuple(operator_terms), film=True,
         complex_term=mc["complex_term"],
         block_kernel_size=block_kernel_size,
         # amplitude_scale is no longer a TransportOperator param (2026-08-22: removed,
@@ -615,6 +628,22 @@ def main():
                          "at dt=1/N instead of once at dt=1 (see TransportOperator.forward's dt handling and "
                          "EXPERIMENT_LOG.md §20/§23). N=1 (default) is exactly the original single-full-step "
                          "behavior, unchanged for every existing config/checkpoint.")
+    p.add_argument("--dense-singlestep", action=argparse.BooleanOptionalAction, default=False,
+                    help="train via FoundationModel.forward_dense_singlestep instead of forward: cond still "
+                         "pools the full --context-frames window (rich conditioning), but every consecutive "
+                         "frame pair inside the (context + --rollout-steps target) window becomes its own "
+                         "directly-supervised single-step example, not just the final transition -- e.g. "
+                         "--context-frames 16 --rollout-steps 1 yields 16 single-step training pairs per "
+                         "window read, all sharing one cond. See FoundationModel.forward_dense_singlestep's "
+                         "docstring. Off by default (original forward() path, unchanged). Requires "
+                         "--encoder-context-frames 1 (or leave unset -- see that flag's own help) to actually "
+                         "encode one frame at a time rather than stacking the full context as channels.")
+    p.add_argument("--encoder-context-frames", type=int, default=None,
+                    help="builds `encoder` (not context_cond_encoder, which always uses --context-frames) "
+                         "with this context length instead of --context-frames -- only meaningful with "
+                         "--dense-singlestep, which needs encoder built at 1 (single-frame encode) while cond "
+                         "still sees the full --context-frames window. Unset (default) falls back to "
+                         "--context-frames, exactly the original behavior where both match.")
     p.add_argument("--complex-term", action=argparse.BooleanOptionalAction, default=True,
                     help="add the FFT-fed complex-rotation branch (complex_proj + ComplexAmplitude/RotationTerm) "
                          "on top of the real Helmholtz terms -- see EXPERIMENT_LOG.md for the single-task history. "
@@ -735,6 +764,7 @@ def main():
         "boundary_geometry": args.boundary_geometry,
         "operator_terms": [t.strip() for t in args.operator_terms.split(",") if t.strip()],
         "context_frames": T,
+        "encoder_context_frames": args.encoder_context_frames if args.encoder_context_frames is not None else T,
         "tasks": {t: {"field_spec": cfg["field_spec"], "decoder_kwargs": cfg["decoder_kwargs"]}
                   for t, cfg in tasks.items()},
     }
@@ -802,22 +832,32 @@ def main():
             for task in task_names:
                 xb, yb, bparams = next(task_iters[task])
                 xb, yb = xb.to(dev), yb.to(dev)
-                # return_latents only on the probe task, only at logged steps -- reuses
-                # this already-scheduled forward call (no extra one added) to also get
-                # back the intermediate rollout LatentStates for rollout_drift_stats.
-                want_latents = log_this_step and task == probe_task
-                out = model(xb, field_spec=tasks[task]["field_spec"], task=task, steps=K,
-                            return_initial_encode=True, n_substeps=args.n_substeps,
-                            return_latents=want_latents)
-                if want_latents:
-                    initial, pred, zs = out
-                    drift_stats = rollout_drift_stats(zs)
+                if args.dense_singlestep:
+                    # Every consecutive frame pair in the (context + target) window is
+                    # its own directly-supervised single-step example -- no separate
+                    # initial-frame term needed here (unlike the rollout path below),
+                    # since every position already gets its own direct next-frame
+                    # supervision. See FoundationModel.forward_dense_singlestep.
+                    pred, target_raw = model.forward_dense_singlestep(
+                        xb, yb, field_spec=tasks[task]["field_spec"], task=task, n_substeps=args.n_substeps)
+                    raw_task_loss = well_style_vrmse(pred, target_raw).mean()
                 else:
-                    initial, pred = out
-                initial_target = xb[:, -1, ...]
-                initial_loss = well_style_vrmse(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()
-                rollout_loss = well_style_vrmse(pred, yb).mean()
-                raw_task_loss = (1.0 / K) * initial_loss + rollout_loss
+                    # return_latents only on the probe task, only at logged steps -- reuses
+                    # this already-scheduled forward call (no extra one added) to also get
+                    # back the intermediate rollout LatentStates for rollout_drift_stats.
+                    want_latents = log_this_step and task == probe_task
+                    out = model(xb, field_spec=tasks[task]["field_spec"], task=task, steps=K,
+                                return_initial_encode=True, n_substeps=args.n_substeps,
+                                return_latents=want_latents)
+                    if want_latents:
+                        initial, pred, zs = out
+                        drift_stats = rollout_drift_stats(zs)
+                    else:
+                        initial, pred = out
+                    initial_target = xb[:, -1, ...]
+                    initial_loss = well_style_vrmse(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()
+                    rollout_loss = well_style_vrmse(pred, yb).mean()
+                    raw_task_loss = (1.0 / K) * initial_loss + rollout_loss
 
                 task_loss = soft_cap_loss(raw_task_loss, args.loss_cap_threshold)
                 if not torch.isfinite(raw_task_loss):
@@ -881,9 +921,14 @@ def main():
                 vloss_sum, vbatches = 0.0, 0
                 for xb, yb, _bparams in val_loaders[t]:
                     xb, yb = xb.to(dev), yb.to(dev)
-                    pred = model(xb, field_spec=tasks[t]["field_spec"], task=t, steps=K,
-                                 return_initial_encode=False, n_substeps=args.n_substeps)
-                    vloss_sum += float(well_style_vrmse(pred, yb).mean().item())
+                    if args.dense_singlestep:
+                        pred, target = model.forward_dense_singlestep(
+                            xb, yb, field_spec=tasks[t]["field_spec"], task=t, n_substeps=args.n_substeps)
+                    else:
+                        pred = model(xb, field_spec=tasks[t]["field_spec"], task=t, steps=K,
+                                     return_initial_encode=False, n_substeps=args.n_substeps)
+                        target = yb
+                    vloss_sum += float(well_style_vrmse(pred, target).mean().item())
                     vbatches += 1
                 vloss_avg = vloss_sum / max(1, vbatches)
                 val_results[t] = vloss_avg
