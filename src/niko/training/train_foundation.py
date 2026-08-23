@@ -61,6 +61,10 @@ from operators.transport_operator import TransportOperator
 from decoders.shared_heads import SharedTrunkFieldHeadsDecoder
 from models.foundation_model import FoundationModel
 from training.losses import well_style_vrmse
+from training.diagnostics import (
+    grad_norms_by_component, pcgrad_conflict_stats, rollout_drift_stats,
+    boundary_geometry_snapshot, log_diagnostics_step,
+)
 from core.soap import SOAP
 import dataloader as dl
 
@@ -202,8 +206,8 @@ def build_tasks(data_root: str, config_root: str, task_set: str = "core3") -> di
     if task_set == "core3":
         return core3
 
-    if task_set != "all14":
-        raise ValueError(f"Unknown task_set '{task_set}'; expected 'core3' or 'all14'")
+    if task_set not in ("all14", "fast4"):
+        raise ValueError(f"Unknown task_set '{task_set}'; expected 'core3', 'all14', or 'fast4'")
 
     all14 = dict(core3)
     all14["rayleigh_benard_uniform"] = dict(
@@ -315,6 +319,23 @@ def build_tasks(data_root: str, config_root: str, task_set: str = "core3") -> di
         decoder_kwargs=dict(zero_mean_pressure=True, use_streamfunction=True,
                              scalar_field_names=["c_zz", "pressure"], tensor_field_names=["C"]),
     )
+
+    if task_set == "fast4":
+        # 2026-08-23: the 4 cheapest tasks worth ablating/stability-testing beyond
+        # rayleigh_benard/active_matter alone -- rayleigh_benard + active_matter (both
+        # already in core3, kept for their own sake) plus the two cheapest all14
+        # additions by real resolution x channel x batch cost (not just batch count --
+        # see the operator-term-ablation entry in EXPERIMENT_LOG.md for how these two
+        # specifically were picked over e.g. euler/helmholtz_staircase, which are
+        # deceptively expensive by that measure despite smaller nominal batch counts).
+        # Reuses all14's own per-task configs verbatim (same dict entries, just a
+        # smaller key subset) so there's exactly one place each task's file/traj
+        # limits and decoder_kwargs are defined -- no separate fast4-specific configs
+        # to drift out of sync with all14's.
+        fast4_names = ("rayleigh_benard", "active_matter", "gray_scott_reaction_diffusion",
+                       "acoustic_scattering_discontinuous")
+        return {name: all14[name] for name in fast4_names}
+
     return all14
 
 
@@ -612,15 +633,27 @@ def main():
     p.add_argument("--seed", type=int, default=42, help="RNG seed for PCGrad's per-step task-pairing order")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--log-interval", type=int, default=50)
+    p.add_argument("--diagnostics", action=argparse.BooleanOptionalAction, default=True,
+                    help="emit a structured JSONL diagnostics record (see training/diagnostics.py) "
+                         "every --log-interval steps: per-component gradient norms (pre-clip), "
+                         "PCGrad inter-task cosine-similarity/conflict stats, and one probe task's "
+                         "per-rollout-step latent-state drift -- plus a per-task boundary-geometry "
+                         "weight snapshot once per epoch. On by default: cheap relative to a "
+                         "forward/backward pass (no extra ones added -- the probe task's rollout "
+                         "just reuses its already-scheduled forward call at logged steps). Written "
+                         "to <save-dir>/diagnostics.jsonl, alongside the existing plain-text log, "
+                         "not replacing it.")
     p.add_argument("--save-dir", default="/app/checkpoints/foundation_model")
     p.add_argument("--data-root", default="/app/data/datasets",
                     help="parent dir containing <task>/data/{train,valid} for each task in TASKS")
     p.add_argument("--config-root", default="/app/configs",
                     help="parent dir containing param_subsets/*.json")
-    p.add_argument("--task-set", default="core3", choices=["core3", "all14"],
+    p.add_argument("--task-set", default="core3", choices=["core3", "all14", "fast4"],
                     help="core3 = original rayleigh_benard/shear_flow/active_matter recipe (default, "
                          "unchanged behavior). all14 = every 2D Well dataset, see build_tasks() for "
-                         "per-task sampling choices.")
+                         "per-task sampling choices. fast4 = rayleigh_benard/active_matter/"
+                         "gray_scott_reaction_diffusion/acoustic_scattering_discontinuous, the 4 "
+                         "cheapest tasks worth a stability/noise-floor check beyond core3 alone.")
     p.add_argument("--task-subset", default=None,
                     help="comma-separated task names to keep from whichever --task-set was built, "
                          "e.g. 'rayleigh_benard,shear_flow' to drop active_matter from core3 for a "
@@ -736,8 +769,14 @@ def main():
     pcgrad_rng = random.Random(args.seed)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = save_dir / "diagnostics.jsonl"
 
     task_names = list(tasks.keys())
+    # Always the same task every step/run, not rotated -- rollout_drift_stats'
+    # numbers are only comparable across steps/epochs/runs if they're all
+    # measuring the same task's rollout. task_names[0] is whichever task
+    # build_tasks()/--task-subset put first, deterministic given the same args.
+    probe_task = task_names[0]
     if args.steps_per_epoch is not None:
         # Fixed budget: every task (including the largest) draws via repeat_forever,
         # none is privileged as "defines the epoch" -- see --steps-per-epoch help.
@@ -758,11 +797,23 @@ def main():
         for step in range(1, steps_per_epoch + 1):
             step_loss = 0.0
             task_grad_vecs = []
+            log_this_step = args.diagnostics and step % args.log_interval == 0
+            drift_stats = None
             for task in task_names:
                 xb, yb, bparams = next(task_iters[task])
                 xb, yb = xb.to(dev), yb.to(dev)
-                initial, pred = model(xb, field_spec=tasks[task]["field_spec"], task=task, steps=K,
-                                       return_initial_encode=True, n_substeps=args.n_substeps)
+                # return_latents only on the probe task, only at logged steps -- reuses
+                # this already-scheduled forward call (no extra one added) to also get
+                # back the intermediate rollout LatentStates for rollout_drift_stats.
+                want_latents = log_this_step and task == probe_task
+                out = model(xb, field_spec=tasks[task]["field_spec"], task=task, steps=K,
+                            return_initial_encode=True, n_substeps=args.n_substeps,
+                            return_latents=want_latents)
+                if want_latents:
+                    initial, pred, zs = out
+                    drift_stats = rollout_drift_stats(zs)
+                else:
+                    initial, pred = out
                 initial_target = xb[:, -1, ...]
                 initial_loss = well_style_vrmse(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()
                 rollout_loss = well_style_vrmse(pred, yb).mean()
@@ -791,12 +842,14 @@ def main():
                 step_loss += loss_item
                 task_loss_sum[task] += loss_item
 
+            conflict_stats = pcgrad_conflict_stats(task_grad_vecs, task_names) if log_this_step else None
             combined = (
                 pcgrad_combine(task_grad_vecs, pcgrad_rng) if args.pcgrad
                 else torch.stack(task_grad_vecs).sum(dim=0)
             )
             _set_grads_from_flat(params, combined)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            comp_grad_norms = grad_norms_by_component(model) if log_this_step else None
+            pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             loss_sum += step_loss
 
@@ -804,6 +857,14 @@ def main():
                 elapsed_ms = (time.perf_counter() - interval_start) * 1000.0
                 print(f"Epoch {ep}  step {step}/{steps_per_epoch}  "
                       f"combined_loss {step_loss:.6f}  time/step {elapsed_ms / args.log_interval:.2f}ms")
+                if args.diagnostics:
+                    log_diagnostics_step(diagnostics_path, {
+                        "type": "step", "epoch": ep, "step": step, "combined_loss": step_loss,
+                        "grad_norm_pre_clip_total": float(pre_clip_norm.item()),
+                        "grad_norms_by_component": comp_grad_norms,
+                        "pcgrad_conflict": conflict_stats,
+                        "rollout_drift": {"probe_task": probe_task, **drift_stats} if drift_stats else None,
+                    })
                 interval_start = time.perf_counter()
 
         print(f"Epoch {ep}   train_loss (avg combined-step loss): {loss_sum / steps_per_epoch:.6f}  ({steps_per_epoch} steps)")
@@ -862,6 +923,13 @@ def main():
             "val_loss_by_task": val_results,
         }, ckpt_out)
         print(f"Saved checkpoint: {ckpt_out}")
+
+        if args.diagnostics:
+            bc_snapshot = boundary_geometry_snapshot(model, task_names)
+            if bc_snapshot is not None:
+                log_diagnostics_step(diagnostics_path, {
+                    "type": "epoch_boundary_geometry", "epoch": ep, "boundary_geometry": bc_snapshot,
+                })
 
 
 if __name__ == "__main__":

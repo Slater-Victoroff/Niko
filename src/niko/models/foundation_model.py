@@ -122,6 +122,7 @@ class FoundationModel(nn.Module):
         steps: int,
         return_initial_encode: bool = True,
         n_substeps: int = 1,
+        return_latents: bool = False,
     ) -> Tensor:
         if task not in self.decoders:
             raise ValueError(f"Unknown task '{task}'; known tasks: {list(self.decoders.keys())}")
@@ -157,7 +158,17 @@ class FoundationModel(nn.Module):
         response_flat = decoder(zs_flat, cond=cond_flat, bc_weights=bc_weights_flat)
         response = response_flat.reshape(B, T, *response_flat.shape[1:])
 
+        # return_latents: opt-in, off by default (zero cost/shape change on the normal
+        # training/eval path) -- exposes the intermediate rollout LatentStates for
+        # diagnostics (see training/diagnostics.py's rollout_drift_stats) without
+        # changing what any existing caller gets back. Always appended as the LAST
+        # element, on top of whatever return_initial_encode's own shape already is,
+        # so callers that don't ask for it are completely unaffected.
         if return_initial_encode:
             decoded_last_frame = decoder(z0.grid, cond=cond, bc_weights=bc_weights)
-            return decoded_last_frame, response
-        return response
+            result = (decoded_last_frame, response)
+        else:
+            result = response
+        if return_latents:
+            return (*result, zs) if isinstance(result, tuple) else (result, zs)
+        return result
