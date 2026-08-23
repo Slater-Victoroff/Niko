@@ -89,6 +89,7 @@ def main():
     print(f"{type(model).__name__} params: total={n_params}, transforms={transforms}, context_frames={T}")
 
     param_choices = None
+    combo_t = combo_transform = None
     if args.param_subset:
         with open(args.param_subset) as f:
             param_choices = [tuple(c) for c in json.load(f)["combos"]]
@@ -135,6 +136,11 @@ def main():
 
     mse = nn.MSELoss()
 
+    if param_choices is not None:
+        combo_t = torch.tensor(param_choices, dtype=torch.float32, device=dev)
+        combo_transform = target_transform_space(combo_t)
+        print(f"Also reporting snap-to-nearest-combo diagnostic against {len(param_choices)} combos.")
+
     for ep in range(1, args.epochs + 1):
         model.train()
         running_loss_sum, running_batches = 0.0, 0
@@ -171,6 +177,9 @@ def main():
         # MSE alone doesn't tell you "how close in physical units", and raw
         # Rayleigh/Prandtl-scale numbers are what this is ultimately for.
         rel_err_sum = torch.zeros(len(transforms), device=dev)
+        vloss_snapped_sum = 0.0
+        rel_err_sum_snapped = torch.zeros(len(transforms), device=dev)
+        exact_match, total = 0, 0
         with torch.no_grad():
             for xb, _yb, bparams in val_loader:
                 xb = xb.to(dev)
@@ -182,6 +191,18 @@ def main():
                 raw_pred = model.invert_transform(pred)
                 raw_true = bparams.to(dev).float()
                 rel_err_sum += ((raw_pred - raw_true).abs() / raw_true.abs().clamp_min(1e-12)).mean(dim=0)
+
+                if combo_transform is not None:
+                    dists = torch.cdist(pred, combo_transform)
+                    nearest = dists.argmin(dim=1)
+                    snapped_raw = combo_t[nearest]
+                    snapped_transform = combo_transform[nearest]
+                    rel_err_sum_snapped += ((snapped_raw - raw_true).abs() / raw_true.abs().clamp_min(1e-12)).mean(dim=0)
+                    vloss_snapped_sum += float(mse(snapped_transform, target).item())
+                    true_nearest = torch.cdist(target, combo_transform).argmin(dim=1)
+                    exact_match += (nearest == true_nearest).sum().item()
+                total += xb.shape[0]
+
                 val_batches += 1
 
         vloss_avg = val_loss_sum / max(1, val_batches)
@@ -189,21 +210,32 @@ def main():
         print(f"Epoch {ep}   valid_loss (transform-space MSE): {vloss_avg:.6f}")
         print(f"Epoch {ep}   valid_mean_relative_error_by_param: {[f'{e:.4f}' for e in rel_err_avg]}")
 
+        result = {
+            "model_state_dict": model.state_dict(),
+            "architecture": args.architecture,
+            "in_channels": args.in_channels,
+            "context_frames": T,
+            "transforms": transforms,
+            "hidden_dim": args.hidden_dim,
+            "epoch": ep,
+            "val_loss": vloss_avg,
+            "val_mean_relative_error_by_param": rel_err_avg,
+        }
+        if combo_transform is not None:
+            vloss_snapped_avg = vloss_snapped_sum / max(1, val_batches)
+            rel_err_snapped_avg = (rel_err_sum_snapped / max(1, val_batches)).tolist()
+            acc = exact_match / max(1, total)
+            print(f"Epoch {ep}   valid_loss_snapped (transform-space MSE after rounding to nearest combo): {vloss_snapped_avg:.6f}")
+            print(f"Epoch {ep}   valid_mean_relative_error_by_param (snapped): {[f'{e:.4f}' for e in rel_err_snapped_avg]}")
+            print(f"Epoch {ep}   valid_exact_combo_match_rate (snapped): {acc:.4f}  ({exact_match}/{total})")
+            result.update(
+                val_loss_snapped=vloss_snapped_avg,
+                val_mean_relative_error_by_param_snapped=rel_err_snapped_avg,
+                val_exact_combo_match_rate=acc,
+            )
+
         ckpt = save_dir / f"paraminfer_{args.architecture}_ep{ep}_ctx{T}_vloss{vloss_avg:.4f}.pt"
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "architecture": args.architecture,
-                "in_channels": args.in_channels,
-                "context_frames": T,
-                "transforms": transforms,
-                "hidden_dim": args.hidden_dim,
-                "epoch": ep,
-                "val_loss": vloss_avg,
-                "val_mean_relative_error_by_param": rel_err_avg,
-            },
-            ckpt,
-        )
+        torch.save(result, ckpt)
         print(f"Saved checkpoint: {ckpt}")
 
 

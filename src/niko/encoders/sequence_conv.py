@@ -17,6 +17,7 @@ class SequenceConvEncoder(EncoderBase):
         latent_dim: int = 16,
         hidden_dim: int = 64,
         cond_dim: Optional[int] = None,
+        block_kernel_size: int = 7,
     ):
         super().__init__()
 
@@ -31,7 +32,7 @@ class SequenceConvEncoder(EncoderBase):
         self.net = nn.Sequential(
             nn.Conv2d(total_in, hidden_dim, kernel_size=4, stride=2, padding=1),
             nn.GELU(),
-            ConvNeXtBlock(hidden_dim),
+            ConvNeXtBlock(hidden_dim, kernel_size=block_kernel_size),
             nn.Conv2d(hidden_dim, latent_dim, kernel_size=1),
         )
 

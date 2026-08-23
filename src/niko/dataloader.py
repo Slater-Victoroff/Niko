@@ -43,6 +43,88 @@ SHEAR_FLOW_FIELD_SPEC = [
     {"key": "t1_fields/velocity", "n_components": 2},
 ]
 
+# --- Remaining 2D Well datasets (added when scaling the foundation model beyond
+# rayleigh_benard/shear_flow/active_matter to all 14 2D tasks). Confirmed against
+# actual on-disk HDF5 structure (h5py direct inspection on AICR), not assumed from
+# dataset names -- see inline notes for anything non-obvious.
+
+# acoustic_scattering_{discontinuous,inclusions,maze} all share this exact layout.
+# t0_fields/density and t0_fields/speed_of_sound are real fields but have NO time
+# axis (shape (N,X,Y), not (N,T,X,Y) -- they describe the static acoustic medium
+# per trajectory, not a time-varying quantity) so they don't fit field_spec's
+# (N,T,...) contract at all and are dropped here. This is a real information loss
+# (the three acoustic_scattering variants differ precisely in their medium
+# structure, and simulation_parameters is empty here too, so nothing else carries
+# that signal to the model) -- fine for a first pass that only predicts
+# pressure/velocity propagation, but worth flagging rather than silently omitting.
+ACOUSTIC_SCATTERING_FIELD_SPEC = [
+    {"key": "t0_fields/pressure", "n_components": 1},
+    {"key": "t1_fields/velocity", "n_components": 2},
+]
+
+# euler_multi_quadrants_{openBC,periodicBC} share this layout: compressible Euler
+# equations (density/energy/pressure all vary independently -- not incompressible,
+# so use_streamfunction is wrong here), momentum (not velocity) is the vector field.
+EULER_MULTI_QUADRANTS_FIELD_SPEC = [
+    {"key": "t0_fields/density", "n_components": 1},
+    {"key": "t0_fields/energy", "n_components": 1},
+    {"key": "t0_fields/pressure", "n_components": 1},
+    {"key": "t1_fields/momentum", "n_components": 2},
+]
+
+# Pure reaction-diffusion (Gray-Scott): two concentration fields, no flow/velocity
+# field in the data at all. Decoder must be built with predict_velocity=False.
+GRAY_SCOTT_FIELD_SPEC = [
+    {"key": "t0_fields/A", "n_components": 1},
+    {"key": "t0_fields/B", "n_components": 1},
+]
+
+# Frequency-domain Helmholtz acoustics: real/imaginary parts of a complex pressure
+# field, no velocity field. t0_fields/mask (the staircase geometry) has neither an
+# N nor a T axis (shape (X,Y), literally one static array shared by the whole
+# dataset) so it can't fit field_spec either -- dropped, same caveat as above.
+# Decoder must be built with predict_velocity=False.
+HELMHOLTZ_STAIRCASE_FIELD_SPEC = [
+    {"key": "t0_fields/pressure_re", "n_components": 1},
+    {"key": "t0_fields/pressure_im", "n_components": 1},
+]
+
+# Shallow-water equations on a sphere (dimensions are theta/phi, not x/y, but
+# H5RayleighBenardFields' axis inference is position-based (always axes 1,2)
+# so this is a mechanical non-issue). Height directly couples to velocity
+# divergence via mass conservation, so this is NOT divergence-free --
+# use_streamfunction=False, same reasoning as the compressible tasks above.
+PLANETSWE_FIELD_SPEC = [
+    {"key": "t0_fields/height", "n_components": 1},
+    {"key": "t1_fields/velocity", "n_components": 2},
+]
+
+# Same physical system and field layout as rayleigh_benard (RB_FIELD_SPEC) --
+# rayleigh_benard_uniform is just a differently-sampled parameter grid, not a
+# different simulation. No separate field_spec needed; reuse RB_FIELD_SPEC
+# directly at the call site.
+
+# Compressible radiative-cooling instability: density and pressure both vary
+# independently (not incompressible) -- use_streamfunction=False.
+TURBULENT_RADIATIVE_LAYER_2D_FIELD_SPEC = [
+    {"key": "t0_fields/density", "n_components": 1},
+    {"key": "t0_fields/pressure", "n_components": 1},
+    {"key": "t1_fields/velocity", "n_components": 2},
+]
+
+# Viscoelastic (Oldroyd-B/FENE-P-style, per the Re/Wi/beta/epsilon/Lmax params)
+# flow: c_zz is the out-of-plane component of the polymer conformation tensor
+# (present even in a 2D flow for this class of constitutive model), C is the
+# in-plane 2x2 conformation tensor. Classic viscoelastic formulations carry an
+# incompressible Newtonian-plus-polymer-stress momentum equation, so
+# use_streamfunction=True is used here, same justification as shear_flow.
+VISCOELASTIC_INSTABILITY_FIELD_SPEC = [
+    {"key": "t0_fields/c_zz", "n_components": 1},
+    {"key": "t0_fields/pressure", "n_components": 1},
+    {"key": "t1_fields/velocity", "n_components": 2},
+    {"key": "t2_fields/C", "n_components": 4},
+]
+
 
 def field_spec_channels(field_spec: List[Dict[str, Any]]) -> int:
     return sum(spec["n_components"] for spec in field_spec)
@@ -231,6 +313,8 @@ class H5RayleighBenardFields(Dataset):
         file_params: Optional[List[Optional[tuple]]] = None,
         return_params: bool = False,
         traj_cache_capacity: int = 32,
+        pair_stride: int = 1,
+        traj_seed: int = 42,
         **legacy_kwargs,
     ):
         if "stack_frames" in legacy_kwargs:
@@ -246,6 +330,18 @@ class H5RayleighBenardFields(Dataset):
         self.predict_frames = int(predict_frames)
         self.device = torch.device(device) if device is not None else None
         self.traj_cache_capacity = max(1, int(traj_cache_capacity))
+        # sample every `pair_stride`-th start position within a trajectory instead of
+        # every consecutive one -- needed for datasets whose trajectories are very long
+        # (gray_scott T=1001, planetswe T=1008: even a single trajectory yields ~990-1000
+        # windows, which file_limit/traj_limit alone can't tame since neither controls
+        # samples *within* one trajectory). Default 1 preserves exact existing behavior.
+        self.pair_stride = max(1, int(pair_stride))
+        # 2026-08-19: traj_limit's selection -- see below -- needs its own seed, kept
+        # independent of create_param_dataloaders' file-selection `seed` param even
+        # though both currently default to 42 and are usually passed the same value by
+        # the caller, so this class stays correct/reproducible on its own if ever
+        # constructed directly (as several call sites/tests already do).
+        self.traj_seed = int(traj_seed)
         # optional per-file params (e.g. rayleigh/prandtl, or reynolds/schmidt,
         # or L/zeta/alpha -- whatever field_spec's dataset uses) parallel to `filepaths`
         self.file_params = file_params
@@ -261,8 +357,14 @@ class H5RayleighBenardFields(Dataset):
                 self._layouts.append(layout)
                 n_traj = layout["n_traj"]
                 T = layout["time_steps"]
-                if traj_limit is not None:
-                    n_traj = min(n_traj, traj_limit)
+                if traj_limit is not None and traj_limit < n_traj:
+                    # Seeded random sample, not a positional head-slice -- see the
+                    # 2026-08-19 comment above self.traj_seed for why. Sorted purely
+                    # for deterministic/readable _pairs ordering; the *set* of indices
+                    # is what matters, not their order.
+                    traj_indices = sorted(random.Random(self.traj_seed + fi).sample(range(n_traj), traj_limit))
+                else:
+                    traj_indices = list(range(n_traj))
 
             needed = self.context_frames + self.predict_frames
 
@@ -270,8 +372,8 @@ class H5RayleighBenardFields(Dataset):
             if T >= needed:
                 max_start = T - needed
 
-            for tj in range(n_traj):
-                for s in range(max_start + 1):
+            for tj in traj_indices:
+                for s in range(0, max_start + 1, self.pair_stride):
                     self._pairs.append(PairIndex(fi, tj, s))
 
         self._open_file_idx: Optional[int] = None
@@ -285,12 +387,17 @@ class H5RayleighBenardFields(Dataset):
         for spec in self.field_spec:
             if spec["key"] not in f:
                 raise KeyError(f"Missing required key '{spec['key']}' in {path}")
-        for key in ("dimensions/x", "dimensions/y"):
-            if key not in f:
-                raise KeyError(f"Missing required key '{key}' in {path}")
 
-        x_len = int(f["dimensions/x"].shape[0])
-        y_len = int(f["dimensions/y"].shape[0])
+        # dimensions/x + dimensions/y are OPTIONAL: only used as a sanity check in
+        # _infer_xy_axes_from_shape (skipped entirely when x_len/y_len are None -- axis
+        # position, not length, is what's actually load-bearing there). Not every Well
+        # dataset uses Cartesian axis names -- planetswe is on a lat-lon sphere grid
+        # (dimensions/theta, dimensions/phi), no dimensions/x or dimensions/y at all.
+        if "dimensions/x" in f and "dimensions/y" in f:
+            x_len = int(f["dimensions/x"].shape[0])
+            y_len = int(f["dimensions/y"].shape[0])
+        else:
+            x_len = y_len = None
 
         n_traj = None
         time_steps = None
@@ -473,7 +580,7 @@ class H5VelocityFramePairs(Dataset):
         )
 
 
-def _read_params_from_h5(path: str) -> Optional[tuple]:
+def read_params_from_h5(path: str) -> Optional[tuple]:
     """Read simulation parameter values directly from the HDF5 file itself --
     every Well-format file self-describes its own varying parameters via
     attrs['simulation_parameters'] (an ordered list of names) and a matching
@@ -499,6 +606,32 @@ def _read_params_from_h5(path: str) -> Optional[tuple]:
             return tuple(values)
     except Exception:
         return None
+
+
+def select_representative_files(files: List[str], k: int, key_fn) -> List[str]:
+    """Deterministically pick up to k files spanning the range of key_fn(file), instead
+    of clustering wherever directory/alphabetical order happens to put the first k.
+
+    Concretely: sorted(os.listdir(...))[:k] (what a plain file_limit does) picked all 7
+    of rayleigh_benard_uniform's Rayleigh=1e10 combos plus one Rayleigh=1e6 file for a
+    file_limit=8 -- Rayleigh spans 1e6-1e10 in the actual data, so that's a 3-decade gap
+    in the one parameter that matters, not a representative sample of it. Never random
+    either -- same input always picks the same files.
+
+    Groups files by key first (so e.g. planetswe's 3 seeds per initial condition collapse
+    to one representative before spacing, rather than burning 3 of k slots on one IC),
+    then evenly spaces k picks across the sorted unique keys.
+    """
+    groups: Dict[Any, List[str]] = defaultdict(list)
+    for f in files:
+        groups[key_fn(f)].append(f)
+    keys_sorted = sorted(groups.keys())
+    if k >= len(keys_sorted):
+        picked_keys = keys_sorted
+    else:
+        idxs = sorted({round(i) for i in np.linspace(0, len(keys_sorted) - 1, k)})
+        picked_keys = [keys_sorted[i] for i in idxs]
+    return [sorted(groups[key])[0] for key in picked_keys]
 
 
 def _round_sig(x: float, sig: int = 6) -> float:
@@ -532,7 +665,7 @@ def _params_match_key(params: tuple, sig: int = 6) -> tuple:
 def _group_files_by_params(filepaths: List[str]) -> Dict[tuple, List[str]]:
     groups: Dict[tuple, List[str]] = defaultdict(list)
     for fp in filepaths:
-        parsed = _read_params_from_h5(fp)
+        parsed = read_params_from_h5(fp)
         if parsed is None:
             continue
         groups[parsed].append(fp)
@@ -745,6 +878,8 @@ def create_param_dataloaders(
     seed: int = 42,
     train_file_limit: Optional[int] = None,
     val_file_limit: Optional[int] = None,
+    traj_limit: Optional[int] = None,
+    pair_stride: int = 1,
     context_frames: int = 1,
     predict_frames: int = 1,
     train_subdir: str = "train",
@@ -760,6 +895,7 @@ def create_param_dataloaders(
     traj_cache_capacity: Optional[int] = None,
     block_size: int = 32,
     field_spec: Optional[List[Dict[str, Any]]] = None,
+    file_select_fn=None,
     **legacy_kwargs,
 ) -> Tuple[DataLoader, DataLoader, Optional[tuple]]:
     if "stack_frames" in legacy_kwargs:
@@ -787,6 +923,15 @@ def create_param_dataloaders(
     train_files_all = _list_h5(train_dir)
     valid_files_all = _list_h5(valid_dir)
 
+    # See select_representative_files: pick k files spanning the varying parameter's
+    # range instead of train_file_limit/val_file_limit's plain head-slice of whatever
+    # order the directory listing happens to be in.
+    if file_select_fn is not None:
+        if train_file_limit is not None and train_file_limit < len(train_files_all):
+            train_files_all = file_select_fn(train_files_all, train_file_limit)
+        if val_file_limit is not None and val_file_limit < len(valid_files_all):
+            valid_files_all = file_select_fn(valid_files_all, val_file_limit)
+
     train_groups = _group_files_by_params(train_files_all)
     valid_groups = _group_files_by_params(valid_files_all)
 
@@ -797,7 +942,7 @@ def create_param_dataloaders(
     chosen = None
     if param_choices:
         wanted_keys = {_params_match_key(tuple(c)) for c in param_choices}
-        file_params_cache = {fp: _read_params_from_h5(fp) for fp in train_files_all + valid_files_all}
+        file_params_cache = {fp: read_params_from_h5(fp) for fp in train_files_all + valid_files_all}
 
         def _matches(fp):
             p = file_params_cache[fp]
@@ -830,7 +975,7 @@ def create_param_dataloaders(
         def _params_for_list(lst):
             out = []
             for fp in lst:
-                parsed = _read_params_from_h5(fp)
+                parsed = read_params_from_h5(fp)
                 out.append(parsed)
             return out
 
@@ -841,6 +986,8 @@ def create_param_dataloaders(
         train_files,
         field_spec=field_spec,
         file_limit=train_file_limit,
+        traj_limit=traj_limit,
+        pair_stride=pair_stride,
         context_frames=context_frames,
         predict_frames=predict_frames,
         device=device,
@@ -848,12 +995,15 @@ def create_param_dataloaders(
         return_params=return_params or use_all_params,
         cache_mode=cache_mode,
         traj_cache_capacity=traj_cache_capacity,
+        traj_seed=seed,
     )
 
     valset = H5RayleighBenardFields(
         val_files,
         field_spec=field_spec,
         file_limit=val_file_limit,
+        traj_limit=traj_limit,
+        pair_stride=pair_stride,
         context_frames=context_frames,
         predict_frames=predict_frames,
         device=device,
@@ -861,6 +1011,7 @@ def create_param_dataloaders(
         return_params=return_params or use_all_params,
         cache_mode=cache_mode,
         traj_cache_capacity=traj_cache_capacity,
+        traj_seed=seed,
     )
 
     train_prefetch = 2 if num_workers and num_workers > 0 else None

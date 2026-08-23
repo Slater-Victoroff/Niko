@@ -83,19 +83,32 @@ class FieldState:
         return FieldState(p, self.buoyancy, self.velocity_x, self.velocity_y)
 
     @staticmethod
-    def velocity_from_streamfunction(psi: Tensor) -> Tuple[Tensor, Tensor]:
+    def velocity_from_streamfunction(
+        psi: Tensor, weights_x: Optional[Tensor] = None, weights_y: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
         """Compute velocity components from streamfunction using central differences.
 
         velocity_x = dpsi/dy, velocity_y = -dpsi/dx
+
+        2026-08-20: was unconditional torch.roll (always circular) -- see
+        core/boundary.py. 3 of the 4 tasks using this (rayleigh_benard,
+        rayleigh_benard_uniform, viscoelastic_instability) have a non-periodic
+        y-axis (wall-Dirichlet/no-slip), only shear_flow is fully periodic --
+        this was computing a periodic derivative for a wall boundary on most of
+        its callers. weights_x/weights_y default to fully-circular (matches the
+        old behavior exactly) when not supplied, e.g. for direct/standalone use.
         """
-        dpsi_dy = 0.5 * (
-            torch.roll(psi, shifts=-1, dims=-2)
-            - torch.roll(psi, shifts=1, dims=-2)
-        )
-        dpsi_dx = 0.5 * (
-            torch.roll(psi, shifts=-1, dims=-1)
-            - torch.roll(psi, shifts=1, dims=-1)
-        )
+        from core.boundary import blended_pad
+        b = psi.shape[0]
+        if weights_x is None:
+            weights_x = torch.zeros(b, 3, device=psi.device, dtype=psi.dtype)
+            weights_x[:, 1] = 1.0
+        if weights_y is None:
+            weights_y = torch.zeros(b, 3, device=psi.device, dtype=psi.dtype)
+            weights_y[:, 1] = 1.0
+        padded = blended_pad(psi, weights_x, weights_y, pad=1)
+        dpsi_dy = 0.5 * (padded[:, :, 2:, 1:-1] - padded[:, :, :-2, 1:-1])
+        dpsi_dx = 0.5 * (padded[:, :, 1:-1, 2:] - padded[:, :, 1:-1, :-2])
         return dpsi_dy, -dpsi_dx
 
     @classmethod
@@ -104,8 +117,10 @@ class FieldState:
         pressure: Tensor,
         buoyancy: Tensor,
         psi: Tensor,
+        weights_x: Optional[Tensor] = None,
+        weights_y: Optional[Tensor] = None,
     ) -> "FieldState":
-        velocity_x, velocity_y = cls.velocity_from_streamfunction(psi)
+        velocity_x, velocity_y = cls.velocity_from_streamfunction(psi, weights_x, weights_y)
         return cls(
             pressure=pressure,
             buoyancy=buoyancy,

@@ -17,14 +17,15 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from encoders.field_embedder import FieldEmbedder, canonical_field_name
-from encoders.context_cond import ContextCondEncoder
-from encoders.sequence_conv import SequenceConvEncoder
-from operators.transport_operator import TransportOperator
+from encoders.field_embedder import canonical_field_name
 from operators.transport_terms import dx_central, dy_central
-from decoders.shared_heads import SharedTrunkFieldHeadsDecoder
-from models.foundation_model import FoundationModel
+import training.train_foundation as tf
 import dataloader as dl
+
+# NOTE 2026-08-20: see the matching note in find_loss_outlier.py -- TASKS here is
+# only for dataloading fields now, model architecture comes from the checkpoint's
+# own model_config. data_dir paths are still stale Docker-era paths, unrelated to
+# and not touched by the checkpoint-drift fix.
 
 
 TASKS = {
@@ -73,36 +74,18 @@ def main():
     dev = torch.device(args.device)
     torch.cuda.set_device(dev)
 
-    ckpt = torch.load(args.checkpoint, map_location=dev)
-    T, K = ckpt["context_frames"], ckpt["rollout_steps"]
-    canonical_dim, latent_dim = ckpt["canonical_dim"], ckpt["latent_dim"]
-    hidden_dim, cond_dim = ckpt["hidden_dim"], ckpt["cond_dim"]
-    decoder_hidden_dim = ckpt["decoder_hidden_dim"]
-
-    channel_specs = union_channel_specs(TASKS)
-    field_embedder = FieldEmbedder(channel_specs, canonical_dim=canonical_dim).to(dev)
-    field_embedder.load_state_dict(ckpt["field_embedder_state_dict"])
-    context_cond_encoder = ContextCondEncoder(
-        in_channels=canonical_dim, context_frames=T, cond_dim=cond_dim, hidden_dim=hidden_dim,
-    ).to(dev)
-    context_cond_encoder.load_state_dict(ckpt["context_cond_encoder_state_dict"])
-    encoder = SequenceConvEncoder(
-        in_channels=canonical_dim, context_frames=T, latent_dim=latent_dim, hidden_dim=hidden_dim,
-    ).to(dev)
-    encoder.load_state_dict(ckpt["encoder_state_dict"])
-    operator = TransportOperator(
-        latent_dim=latent_dim, hidden_dim=hidden_dim, cond_dim=cond_dim,
-        terms=("advection", "diffusion", "skew", "forcing"), film=True,
-    ).to(dev)
-    operator.load_state_dict(ckpt["operator_state_dict"])
+    # Single drift-proof load -- see the matching note in find_loss_outlier.py.
+    model, ckpt = tf.load_foundation_checkpoint(args.checkpoint, dev)
+    model.eval()
+    K = ckpt["rollout_steps"]
+    T = ckpt["model_config"]["context_frames"]
+    field_embedder = model.field_embedder
+    context_cond_encoder = model.context_cond_encoder
+    encoder = model.encoder
+    operator = model.operator
 
     cfg = TASKS[args.task]
-    decoder = SharedTrunkFieldHeadsDecoder(
-        latent_dim=latent_dim, hidden_dim=decoder_hidden_dim, upsample=2, **cfg["decoder_kwargs"],
-    ).to(dev)
-    decoder.load_state_dict(ckpt["decoder_state_dicts"][args.task])
-    model = FoundationModel(field_embedder, context_cond_encoder, encoder, operator, {args.task: decoder}).to(dev)
-    model.eval()
+    ckpt_field_spec = ckpt["model_config"]["tasks"][args.task]["field_spec"]
 
     param_choices = None
     if cfg.get("param_subset"):
@@ -112,7 +95,7 @@ def main():
     train_loader, _val_loader, _ = dl.create_param_dataloaders(
         cfg["data_dir"], batch_size=1, context_frames=T, predict_frames=K,
         num_workers=0, param_choices=param_choices,
-        train_file_limit=cfg.get("train_file_limit"), field_spec=cfg["field_spec"],
+        train_file_limit=cfg.get("train_file_limit"), field_spec=ckpt_field_spec,
         traj_cache_capacity=8, shuffle_train=False,
     )
 
@@ -129,7 +112,7 @@ def main():
             xb = xb.to(dev)
             print(f"\n{'='*70}\nbatch {i}  bparams={bparams[0].tolist()}")
 
-            x_context = field_embedder(xb, cfg["field_spec"])
+            x_context = field_embedder(xb, ckpt_field_spec, args.task)
             cond = context_cond_encoder(x_context)
             z = encoder(x_context)
             print(f"  z0.real_grid: norm={z.real_grid.norm().item():.4f} max_abs={z.real_grid.abs().max().item():.4f}")

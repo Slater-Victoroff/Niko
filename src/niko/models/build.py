@@ -8,9 +8,11 @@ from operators.transport_operator import (
     TransportOperator,
     AdvectionDiffusionOperator,
     HelmholtzTransportOperator,
+    HelmholtzRotationTransportOperator,
     LocalAttentionTransportOperator,
     FiLMAdvectionDiffusionOperator,
     FiLMHelmholtzTransportOperator,
+    FiLMHelmholtzRotationTransportOperator,
     FiLMLocalAttentionTransportOperator,
 )
 from operators.direct_field_operator import DirectFieldOperator
@@ -76,9 +78,11 @@ def build_operator(cfg):
         "transport": TransportOperator,
         "advection_diffusion": AdvectionDiffusionOperator,
         "helmholtz_transport": HelmholtzTransportOperator,
+        "helmholtz_rotation_transport": HelmholtzRotationTransportOperator,
         "local_attention_transport": LocalAttentionTransportOperator,
         "film_advection_diffusion": FiLMAdvectionDiffusionOperator,
         "film_helmholtz": FiLMHelmholtzTransportOperator,
+        "film_helmholtz_rotation": FiLMHelmholtzRotationTransportOperator,
         "film_local_attention": FiLMLocalAttentionTransportOperator,
     }
 

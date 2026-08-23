@@ -20,6 +20,24 @@ from core.soap import SOAP
 import dataloader as dl
 
 
+def _curriculum_k(epoch: int, total_epochs: int, k_start: int, k_end: int) -> int:
+    """Linear ramp from k_start (epoch 1) to k_end (final epoch), one step
+    per epoch -- e.g. 7 epochs, k_start=2, k_end=16 gives 2,4,7,9,11,14,16.
+    Motivation: a fixed rollout_steps the whole time asks the model to solve
+    short-horizon transition accuracy AND long-horizon coherence
+    simultaneously from scratch; training on short rollouts first (where the
+    immediate next-state transition is the only thing being scored, not
+    diluted 1/K across a whole trajectory) then growing the horizon lets the
+    model establish accurate per-step dynamics before being asked to hold
+    them stable over many steps. See EXPERIMENT_LOG.md.
+    """
+    if total_epochs <= 1:
+        return k_end
+    frac = (epoch - 1) / (total_epochs - 1)
+    k = round(k_start + frac * (k_end - k_start))
+    return max(1, min(k_end, k))
+
+
 def train(
     cfg_path: str,
     data_dir: str,
@@ -44,6 +62,10 @@ def train(
     diag_kappa: float = 0.1,
     diag_nu: float | None = None,
     diag_g: float = 1.0,
+    rollout_curriculum_start: int | None = None,
+    resume_from: str | None = None,
+    start_epoch: int = 1,
+    n_substeps: int = 1,
 ):
     torch.cuda.set_device(device)
     with open(cfg_path, "r") as f:
@@ -72,6 +94,21 @@ def train(
     model = build_model(copy.deepcopy(cfg))
     dev = torch.device(device)
     model.to(dev)
+
+    if resume_from is not None:
+        # Only model_state_dict is ever saved (see the checkpoint block below) -- no
+        # optimizer state, so SOAP's preconditioner starts cold again here rather than
+        # picking up its prior running estimate. Fine for "keep training this checkpoint
+        # a few more epochs to see if it's still improving" (the actual use case this was
+        # added for); if warm-restarting the optimizer state ever matters, that's a
+        # separate change (save/load opt.state_dict() too).
+        ckpt = torch.load(resume_from, map_location=dev, weights_only=False)
+        sd = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(f"--resume-from {resume_from}: checkpoint mismatch, "
+                                f"missing={missing}, unexpected={unexpected}")
+        print(f"Resumed weights from {resume_from} (checkpoint epoch {ckpt.get('epoch') if isinstance(ckpt, dict) else '?'})")
 
     param_choices = None
     if param_subset:
@@ -112,12 +149,26 @@ def train(
 
     initial_anchor = cfg.get("anchor_target", False)
 
-    for ep in range(1, epochs + 1):
+    for ep in range(start_epoch, start_epoch + epochs):
         model.train()
         running_loss_sum, running_batches = 0.0, 0
         interval_batches = 0
         interval_start = time.perf_counter()
         tb = len(train_loader)
+
+        # k_train: this epoch's training rollout length. Fixed at K (unchanged behavior)
+        # unless rollout_curriculum_start is set, in which case it ramps K_start -> K
+        # linearly over the epochs (see _curriculum_k) -- train_loader/val_loader are
+        # always built at the full K (predict_frames=K), so early-curriculum epochs just
+        # use a PREFIX of yb and a shorter model rollout, not a different dataloader.
+        # Validation always evaluates at the full K regardless of k_train, so valid_loss
+        # stays comparable epoch to epoch and across curriculum vs non-curriculum runs.
+        if rollout_curriculum_start is not None:
+            k_train = _curriculum_k(ep, epochs, rollout_curriculum_start, K)
+        else:
+            k_train = K
+        print(f"Epoch {ep}   k_train: {k_train}" + (f" (curriculum, target {K})" if rollout_curriculum_start is not None else "")
+              + (f"   n_substeps: {n_substeps}" if n_substeps != 1 else ""))
 
         for batch_idx, batch_data in enumerate(train_loader):
             iter_wall_start = time.perf_counter()
@@ -143,18 +194,20 @@ def train(
                 fwd_start = None
                 batch_load_time = 0.0
 
+            yb_k = yb[:, :k_train]
+
             opt.zero_grad()
-            pred = model(xb, steps=K, params=params_obj, debug_timing=debug_timing, return_initial_encode=initial_anchor)
+            pred = model(xb, steps=k_train, params=params_obj, debug_timing=debug_timing, return_initial_encode=initial_anchor, n_substeps=n_substeps)
 
             if initial_anchor:
                 initial, pred = pred
                 initial_target = xb[:, -1, ...]
                 initial_loss = well_style_vrmse(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()
-                rollout_loss = well_style_vrmse(pred, yb).mean()
-                initial_weight = 1 / K
+                rollout_loss = well_style_vrmse(pred, yb_k).mean()
+                initial_weight = 1 / k_train
                 loss = initial_weight * initial_loss + rollout_loss
             else:
-                loss = well_style_vrmse(pred, yb).mean()
+                loss = well_style_vrmse(pred, yb_k).mean()
             if debug_timing:
                 loss_start = torch.cuda.Event(enable_timing=True)
                 loss_start.record()
@@ -186,11 +239,11 @@ def train(
 
             if log_physics and diag_interval > 0 and batch_idx > 0 and batch_idx % diag_interval == 0:
                 global_step = (ep - 1) * total_batches + batch_idx
-                diag = compute_physics_diagnostics(pred.detach(), yb.detach(), kappa=diag_kappa, nu=diag_nu, g=diag_g)
+                diag = compute_physics_diagnostics(pred.detach(), yb_k.detach(), kappa=diag_kappa, nu=diag_nu, g=diag_g)
                 print(format_diagnostics(diag, step=global_step, prefix="TRAIN_DIAG"))
 
             if batch_idx > 0 and batch_idx % log_interval == 0:
-                sample_vrmse = well_style_vrmse(pred.detach(), yb.detach()).mean().item()
+                sample_vrmse = well_style_vrmse(pred.detach(), yb_k.detach()).mean().item()
                 if dev.type == "cuda":
                     torch.cuda.synchronize()
                 interval_elapsed_ms = (time.perf_counter() - interval_start) * 1000.0
@@ -239,7 +292,7 @@ def train(
                 vyb = vyb.to(dev)
                 vp = Params(values=vparams.to(dev))
 
-                vpred = model(vxb, steps=K, params=vp, return_initial_encode=False)
+                vpred = model(vxb, steps=K, params=vp, return_initial_encode=False, n_substeps=n_substeps)
                 # use variance-normalized MSE (VRMSE) as validation metric
                 vloss = well_style_vrmse(vpred, vyb.to(dev))
                 val_loss_sum += float(vloss.mean())
@@ -258,7 +311,8 @@ def train(
             val_diag_avg = {k: v / val_diag_count for k, v in val_diag_accum.items()}
             print(format_diagnostics(val_diag_avg, step=ep, prefix="VAL_DIAG  "))
 
-        ckpt = save_dir / f"model_ep{ep}_ctx{T}_roll{K}_vloss{vloss_avg:.4f}_lr{lr:.0e}_b{batch}.pt"
+        substep_tag = f"_sub{n_substeps}" if n_substeps != 1 else ""
+        ckpt = save_dir / f"model_ep{ep}_ctx{T}_roll{K}{substep_tag}_vloss{vloss_avg:.4f}_lr{lr:.0e}_b{batch}.pt"
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
@@ -316,6 +370,27 @@ def main():
                    help="kinematic viscosity nu for momentum residual (default: same as kappa)")
     p.add_argument("--diag-g", type=float, default=1.0,
                    help="gravity coefficient g in vertical momentum forcing term g*b")
+    p.add_argument("--rollout-curriculum-start", type=int, default=None,
+                   help="if set, ramps the TRAINING rollout length linearly from this value "
+                        "(epoch 1) up to --rollout-steps (final epoch), one step per epoch -- "
+                        "validation always uses the full --rollout-steps regardless. "
+                        "Default: unset, fixed rollout_steps every epoch (unchanged behavior).")
+    p.add_argument("--resume-from", default=None,
+                   help="path to a checkpoint .pt to load model weights from before training "
+                        "starts -- e.g. to keep training a run that hadn't converged yet. Only "
+                        "the weights carry over (checkpoints don't save optimizer state), so "
+                        "SOAP's preconditioner starts cold. Pair with --start-epoch so logging/ "
+                        "checkpoint filenames reflect the true cumulative epoch instead of "
+                        "restarting at 1.")
+    p.add_argument("--start-epoch", type=int, default=1,
+                   help="epoch number to start counting from (only affects logging/checkpoint "
+                        "filenames and, if --rollout-curriculum-start is also set, its ramp -- "
+                        "does not affect training when curriculum is unset). Use with --resume-from.")
+    p.add_argument("--n-substeps", type=int, default=1,
+                   help="calls the operator this many times per output frame at dt=1/n_substeps "
+                        "instead of once at dt=1 -- DISCO-inspired sub-step integration (see "
+                        "EXPERIMENT_LOG.md §20). 1 (default) is the original, unchanged behavior. "
+                        "Applies to both training and validation rollouts (same value for both).")
     args = p.parse_args()
     train(
         args.config,
@@ -341,6 +416,10 @@ def main():
         diag_kappa=args.diag_kappa,
         diag_nu=args.diag_nu,
         diag_g=args.diag_g,
+        rollout_curriculum_start=args.rollout_curriculum_start,
+        resume_from=args.resume_from,
+        start_epoch=args.start_epoch,
+        n_substeps=args.n_substeps,
     )
 
 

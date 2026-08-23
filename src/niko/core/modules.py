@@ -81,14 +81,22 @@ class OperatorBase(ValidatedModule, nn.Module, ABC):
         self,
         z: LatentState,
         cond: Optional[Tensor] = None,
+        bc_weights: Optional[Tuple[Tensor, Tensor]] = None,
+        dt: float = 1.0,
     ) -> LatentState:
         raise NotImplementedError
 
-    def validate_input(self, z: LatentState, cond: Optional[Tensor] = None) -> None:
+    def validate_input(
+        self, z: LatentState, cond: Optional[Tensor] = None,
+        bc_weights: Optional[Tuple[Tensor, Tensor]] = None, dt: float = 1.0,
+    ) -> None:
         assert isinstance(z, LatentState), f"Expected z to be a LatentState, got {type(z)}"
 
 
 class DecoderBase(ValidatedModule, nn.Module, ABC):
     @abstractmethod
-    def forward(self, z: Tensor | LatentState, cond: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self, z: Tensor | LatentState, cond: Optional[Tensor] = None,
+        bc_weights: Optional[Tuple[Tensor, Tensor]] = None,
+    ) -> Tensor:
         raise NotImplementedError

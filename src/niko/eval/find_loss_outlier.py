@@ -15,14 +15,21 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from encoders.field_embedder import FieldEmbedder, canonical_field_name
-from encoders.context_cond import ContextCondEncoder
-from encoders.sequence_conv import SequenceConvEncoder
-from operators.transport_operator import TransportOperator
-from decoders.shared_heads import SharedTrunkFieldHeadsDecoder
-from models.foundation_model import FoundationModel
+from encoders.field_embedder import canonical_field_name
+import training.train_foundation as tf
 from training.losses import well_style_vrmse
 import dataloader as dl
+
+# NOTE 2026-08-20: TASKS below is this script's OWN local copy (data_dir/
+# param_subset/field_spec), independent of train_foundation.py's build_tasks() --
+# kept only for the dataloading fields (data_dir, param_subset, train_file_limit)
+# a checkpoint doesn't carry. Model *architecture* now comes entirely from the
+# checkpoint's own saved model_config (see load_foundation_checkpoint below), not
+# from this dict, so a mismatch here can no longer silently break reconstruction
+# the way it used to. data_dir values are still the old Docker-era /app/data/...
+# paths, not migrated to AICR's /work/aihub/... layout -- unrelated to the
+# checkpoint-drift fix, not touched here; this script needs --data-root wiring
+# (like train_foundation.py has) before it's actually runnable on AICR.
 
 
 TASKS = {
@@ -72,42 +79,21 @@ def main():
     dev = torch.device(args.device)
     torch.cuda.set_device(dev)
 
-    ckpt = torch.load(args.checkpoint, map_location=dev)
-    T, K = ckpt["context_frames"], ckpt["rollout_steps"]
-    canonical_dim, latent_dim = ckpt["canonical_dim"], ckpt["latent_dim"]
-    hidden_dim, cond_dim = ckpt["hidden_dim"], ckpt["cond_dim"]
-    decoder_hidden_dim = ckpt["decoder_hidden_dim"]
+    # Single drift-proof load: architecture rebuilt from the checkpoint's own
+    # model_config (not from this file's local TASKS), full state_dict loaded --
+    # see build_foundation_model/load_foundation_checkpoint in train_foundation.py.
+    model, ckpt = tf.load_foundation_checkpoint(args.checkpoint, dev)
+    model.eval()
+    K = ckpt["rollout_steps"]
+    T = ckpt["model_config"]["context_frames"]
     print(f"Loaded {args.checkpoint} (epoch={ckpt['epoch']}, val_loss_by_task={ckpt['val_loss_by_task']})")
 
-    channel_specs = union_channel_specs(TASKS)
-    field_embedder = FieldEmbedder(channel_specs, canonical_dim=canonical_dim).to(dev)
-    field_embedder.load_state_dict(ckpt["field_embedder_state_dict"])
-    context_cond_encoder = ContextCondEncoder(
-        in_channels=canonical_dim, context_frames=T, cond_dim=cond_dim, hidden_dim=hidden_dim,
-    ).to(dev)
-    context_cond_encoder.load_state_dict(ckpt["context_cond_encoder_state_dict"])
-    encoder = SequenceConvEncoder(
-        in_channels=canonical_dim, context_frames=T, latent_dim=latent_dim, hidden_dim=hidden_dim,
-    ).to(dev)
-    encoder.load_state_dict(ckpt["encoder_state_dict"])
-    operator = TransportOperator(
-        latent_dim=latent_dim, hidden_dim=hidden_dim, cond_dim=cond_dim,
-        terms=("advection", "diffusion", "skew", "forcing"), film=True,
-    ).to(dev)
-    operator.load_state_dict(ckpt["operator_state_dict"])
-
-    decoders = {}
-    for task, cfg in TASKS.items():
-        dec = SharedTrunkFieldHeadsDecoder(
-            latent_dim=latent_dim, hidden_dim=decoder_hidden_dim, upsample=2, **cfg["decoder_kwargs"],
-        ).to(dev)
-        dec.load_state_dict(ckpt["decoder_state_dicts"][task])
-        decoders[task] = dec
-
-    model = FoundationModel(field_embedder, context_cond_encoder, encoder, operator, decoders).to(dev)
-    model.eval()
-
     cfg = TASKS[args.task]
+    # field_spec for both the dataloader and the forward call below comes from the
+    # checkpoint's own model_config, not this file's local TASKS -- so a stale/
+    # mismatched local field_spec can't silently misalign channels the way it could
+    # before.
+    ckpt_field_spec = ckpt["model_config"]["tasks"][args.task]["field_spec"]
     import json
     param_choices = None
     if cfg.get("param_subset"):
@@ -117,7 +103,7 @@ def main():
     train_loader, _val_loader, _ = dl.create_param_dataloaders(
         cfg["data_dir"], batch_size=args.batch, context_frames=T, predict_frames=K,
         num_workers=0, param_choices=param_choices,
-        train_file_limit=cfg.get("train_file_limit"), field_spec=cfg["field_spec"],
+        train_file_limit=cfg.get("train_file_limit"), field_spec=ckpt_field_spec,
         traj_cache_capacity=8, shuffle_train=False,
     )
     print(f"Sweeping {len(train_loader)} batches of {args.task} train data...")
@@ -127,7 +113,7 @@ def main():
     with torch.no_grad():
         for i, (xb, yb, bparams) in enumerate(train_loader):
             xb, yb = xb.to(dev), yb.to(dev)
-            initial, pred = model(xb, field_spec=cfg["field_spec"], task=args.task, steps=K,
+            initial, pred = model(xb, field_spec=ckpt_field_spec, task=args.task, steps=K,
                                    return_initial_encode=True)
             initial_target = xb[:, -1, ...]
             initial_loss = well_style_vrmse(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()

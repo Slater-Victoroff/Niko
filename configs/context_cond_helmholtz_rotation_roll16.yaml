@@ -1,0 +1,38 @@
+# Same as context_cond_helmholtz_rotation.yaml (the reference winner), but
+# trained directly at rollout_steps=16 instead of 6 (pass --rollout-steps 16
+# to train.py) -- tests whether training-time exposure to a longer horizon
+# fixes the catastrophic long-horizon divergence found in EXPERIMENT_LOG.md
+# §14 (evaluated via extrapolation of the roll6-trained checkpoint, never
+# trained at more than roll6). model.use_checkpointing lets this train at
+# the same batch=8 every other config in this file uses -- roll16 at batch=8
+# OOMs without it; see §15 for why (gradient checkpointing, exact not
+# approximate, chunked decoder calls specifically).
+anchor_target: true
+
+context_cond_encoder:
+  in_channels: 4
+  cond_dim: 32
+  hidden_dim: 64
+
+encoder:
+  name: sequence_conv
+  in_channels: 4
+  latent_dim: 16
+  hidden_dim: 64
+
+operator:
+  name: film_helmholtz_rotation
+  latent_dim: 16
+  hidden_dim: 64
+  cond_dim: 32
+
+decoder:
+  name: shared_heads
+  latent_dim: 16
+  hidden_dim: 48
+  upsample: 2
+  zero_mean_pressure: true
+  use_streamfunction: true
+
+model:
+  use_checkpointing: true

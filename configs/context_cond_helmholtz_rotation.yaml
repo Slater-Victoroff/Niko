@@ -1,0 +1,43 @@
+# Reference config for this codebase's latent operator. Same encoder/decoder
+# as plain_helmholtz.yaml/context_cond_helmholtz.yaml; the operator is
+# advection+diffusion+skew+forcing plus HelmholtzRotationTerm -- a designated
+# 2-channel real_grid vector-pair (channels [0:2]) is Helmholtz-split every
+# rollout step via k_hat(k_hat.V) in Fourier space, and only its solenoidal
+# (divergence-free) part gets a conservative, per-frequency-bin phase
+# rotation. Beat plain baseline by ~4.1% on quick2 (0.2292 vs 0.2389) and by
+# ~1.1-1.4% over the previous best broad8 reference on the full broad8/
+# 7-epoch protocol (0.2266 final / 0.2258 best).
+#
+# This is the surviving result of an extended ablation thread (raw-channel
+# conserved subspaces, scalar vs per-frequency-bin phase, multi-pair
+# coverage, a residual-decode architecture, a spectral-matching loss, and a
+# separate complex/spectral branch conserved three different ways) -- every
+# alternative tried lost to this configuration. Full history in
+# EXPERIMENT_LOG.md; the losing code/configs were deleted once this was
+# settled, not archived -- the log is the durable record.
+anchor_target: true
+
+context_cond_encoder:
+  in_channels: 4
+  cond_dim: 32
+  hidden_dim: 64
+
+encoder:
+  name: sequence_conv
+  in_channels: 4
+  latent_dim: 16
+  hidden_dim: 64
+
+operator:
+  name: film_helmholtz_rotation
+  latent_dim: 16
+  hidden_dim: 64
+  cond_dim: 32
+
+decoder:
+  name: shared_heads
+  latent_dim: 16
+  hidden_dim: 48
+  upsample: 2
+  zero_mean_pressure: true
+  use_streamfunction: true

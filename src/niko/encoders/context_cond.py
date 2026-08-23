@@ -1,3 +1,5 @@
+from typing import List
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -40,6 +42,7 @@ class ContextCondEncoder(nn.Module):
         context_frames: int,
         cond_dim: int,
         hidden_dim: int = 64,
+        block_kernel_size: int = 7,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -50,11 +53,11 @@ class ContextCondEncoder(nn.Module):
         self.trunk = nn.Sequential(
             nn.Conv2d(total_in, hidden_dim, kernel_size=4, stride=2, padding=1),
             nn.GELU(),
-            ConvNeXtBlock(hidden_dim),
+            ConvNeXtBlock(hidden_dim, kernel_size=block_kernel_size),
 
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=4, stride=2, padding=1),
             nn.GELU(),
-            ConvNeXtBlock(hidden_dim),
+            ConvNeXtBlock(hidden_dim, kernel_size=block_kernel_size),
         )
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -200,3 +203,61 @@ class LatentContextCondEncoder(nn.Module):
         pooled_spatial = pooled_spatial.view(b, t, -1)
         pooled_time = pooled_spatial.mean(dim=1)
         return self.head(pooled_time)
+
+
+class BoundaryGeometryHead(nn.Module):
+    """Infers per-axis boundary-condition-like padding weights from context -- a
+    small, deliberately narrow bottleneck (nowhere near cond_dim's width) whose
+    only job is "how should the boundary behave," not general-purpose conditioning.
+    See core/boundary.py for the motivating problem and how these weights get used.
+
+    2026-08-21: per-task heads, not one head shared across every task -- a single
+    shared head was the original (wrong) design, and it showed: inspecting a
+    trained 12-task checkpoint found euler_multi_quadrants_openBC (the only fully-
+    open-both-axes task in the set) had learned essentially nothing, still sitting
+    at ~99.9% circular after 5 epochs, while every other task (even genuinely
+    periodic ones like shear_flow) had drifted toward "replicate" regardless of
+    their actual BC. One shared Linear was evidently converging toward whatever
+    blend helps the aggregate gradient across 12 wildly different tasks, not
+    learning each task's own actual geometry -- exactly the same class of problem
+    already fixed for FieldEmbedder (per-task copies instead of one shared
+    embedder per field name). Same fix here: one independent head per task, each
+    identically zero-inited (no warm-start-from-a-shared-prior step needed the way
+    FieldEmbedder's per-field copies needed one, since every copy's zero-init here
+    is already deterministic/identical regardless of task).
+
+    Each head takes the same field-embedded context every other context-inferred
+    module sees, mean-pools over time+space (cheap, no new trunk), maps to 2*3=6
+    logits (3 per axis: zero/circular/replicate), softmax per axis independently.
+
+    Zero-inited so every sample starts at exactly [0, 1, 0] per axis (100%
+    circular) -- behaviorally identical to the old unconditional-roll/zero-pad
+    code at initialization, matching this codebase's established zero-init
+    convention for every other newly-added conditioned term (FiLMConvNeXtBlock's
+    film layer, DiffusionTerm/SkewTerm's cond heads, complex_proj); only drifts
+    away from pure-periodic as training finds reason to, independently per task.
+    """
+
+    def __init__(self, in_channels: int, tasks: List[str]):
+        super().__init__()
+
+        def _make_head() -> nn.Linear:
+            head = nn.Linear(in_channels, 6)
+            nn.init.zeros_(head.weight)
+            with torch.no_grad():
+                bias = head.bias.view(2, 3)
+                bias.zero_()
+                bias[:, 1] = 8.0  # circular logit raised -- softmax([0,8,0]) ~= [3e-4, 0.9997, 3e-4]
+            return head
+
+        self.heads = nn.ModuleDict({name: _make_head() for name in tasks})
+
+    def forward(self, x_context: Tensor, task: str):
+        """x_context: [B, T, C, H, W] (field-embedded canonical context) ->
+        (weights_x [B, 3], weights_y [B, 3])."""
+        if task not in self.heads:
+            raise ValueError(f"No boundary-geometry head registered for task '{task}'")
+        pooled = x_context.mean(dim=(1, 3, 4))  # [B, C]
+        logits = self.heads[task](pooled).view(-1, 2, 3)
+        weights = logits.softmax(dim=-1)
+        return weights[:, 0], weights[:, 1]

@@ -39,6 +39,18 @@ class SharedTrunkFieldHeadsDecoder(DecoderBase):
     a future physics diagnostic), not baked in here.
 
     Both default to None/empty, changing nothing about existing configs.
+
+    predict_velocity (default True, changes nothing about existing configs):
+    some Well tasks have no velocity field at all (gray_scott_reaction_diffusion's
+    A/B concentrations, helmholtz_staircase's pressure_re/pressure_im -- pure
+    reaction-diffusion / frequency-domain acoustics, no flow field to predict).
+    False drops stream_head/velocity_head entirely, so the decoder's output
+    channel count exactly matches scalar_field_names + tensor_field_names with
+    no velocity pair tacked on -- required for those tasks' target tensor
+    (built from a field_spec with no t1_fields entry) to line up with decoder
+    output at all. Only affects the scalar_field_names-given path; the legacy
+    fixed RB path (scalar_field_names=None) always has a real velocity field
+    and is untouched.
     """
 
     def __init__(
@@ -50,6 +62,8 @@ class SharedTrunkFieldHeadsDecoder(DecoderBase):
         use_streamfunction: bool = False,
         tensor_field_names: Optional[list] = None,
         scalar_field_names: Optional[list] = None,
+        predict_velocity: bool = True,
+        block_kernel_size: int = 7,
     ):
         super().__init__()
 
@@ -57,18 +71,19 @@ class SharedTrunkFieldHeadsDecoder(DecoderBase):
         self.use_streamfunction = use_streamfunction
         self.tensor_field_names = list(tensor_field_names) if tensor_field_names else []
         self.scalar_field_names = list(scalar_field_names) if scalar_field_names is not None else None
+        self.predict_velocity = bool(predict_velocity) if self.scalar_field_names is not None else True
 
         trunk = [
             nn.Conv2d(latent_dim, hidden_dim, 3, padding=1),
             nn.GELU(),
-            ConvNeXtBlock(hidden_dim),
+            ConvNeXtBlock(hidden_dim, kernel_size=block_kernel_size),
         ]
 
         if upsample == 2:
             trunk += [
                 nn.Conv2d(hidden_dim, hidden_dim * 4, 3, padding=1),
                 nn.PixelShuffle(2),
-                ConvNeXtBlock(hidden_dim),
+                ConvNeXtBlock(hidden_dim, kernel_size=block_kernel_size),
             ]
 
         self.trunk = nn.Sequential(*trunk)
@@ -81,17 +96,19 @@ class SharedTrunkFieldHeadsDecoder(DecoderBase):
                 name: nn.Conv2d(hidden_dim, 1, 1) for name in self.scalar_field_names
             })
 
-        if self.use_streamfunction:
-            self.stream_head = nn.Conv2d(hidden_dim, 1, 1)
-        else:
-            self.velocity_head = nn.Conv2d(hidden_dim, 2, 1)
+        if self.predict_velocity:
+            if self.use_streamfunction:
+                self.stream_head = nn.Conv2d(hidden_dim, 1, 1)
+            else:
+                self.velocity_head = nn.Conv2d(hidden_dim, 2, 1)
 
         self.tensor_heads = nn.ModuleDict({
             name: nn.Conv2d(hidden_dim, 4, kernel_size=1) for name in self.tensor_field_names
         })
 
-    def forward(self, x: Tensor, cond: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, cond: Tensor | None = None, bc_weights: Optional[tuple] = None) -> Tensor:
         h = self.trunk(x)
+        wx, wy = bc_weights if bc_weights is not None else (None, None)
 
         if self.scalar_field_names is None:
             p = self.pressure_head(h)
@@ -103,6 +120,8 @@ class SharedTrunkFieldHeadsDecoder(DecoderBase):
                     pressure=p,
                     buoyancy=b,
                     psi=psi,
+                    weights_x=wx,
+                    weights_y=wy,
                 )
             else:
                 uv = self.velocity_head(h)
@@ -123,14 +142,16 @@ class SharedTrunkFieldHeadsDecoder(DecoderBase):
                 idx = self.scalar_field_names.index("pressure")
                 scalar_outs[idx] = scalar_outs[idx] - scalar_outs[idx].mean(dim=(-2, -1), keepdim=True)
 
-            if self.use_streamfunction:
-                psi = self.stream_head(h)
-                vx, vy = FieldState.velocity_from_streamfunction(psi)
-                vel_out = torch.cat([vx, vy], dim=1)
+            if self.predict_velocity:
+                if self.use_streamfunction:
+                    psi = self.stream_head(h)
+                    vx, vy = FieldState.velocity_from_streamfunction(psi, wx, wy)
+                    vel_out = torch.cat([vx, vy], dim=1)
+                else:
+                    vel_out = self.velocity_head(h)
+                out = torch.cat(scalar_outs + [vel_out], dim=1)
             else:
-                vel_out = self.velocity_head(h)
-
-            out = torch.cat(scalar_outs + [vel_out], dim=1)
+                out = torch.cat(scalar_outs, dim=1)
 
         if self.tensor_field_names:
             tensor_outs = [self.tensor_heads[name](h) for name in self.tensor_field_names]

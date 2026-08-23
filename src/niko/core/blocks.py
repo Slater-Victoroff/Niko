@@ -62,10 +62,12 @@ class LocallyConnected1x1(nn.Module):
 
 
 class FiLMConvNeXtBlock(nn.Module):
-    def __init__(self, dim: int, cond_dim: int, expansion: int = 4):
+    def __init__(self, dim: int, cond_dim: int, expansion: int = 4, kernel_size: int = 7):
         super().__init__()
 
-        self.dw = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        # See ConvNeXtBlock's own comment: depthwise cost scales as dim*K^2, cheap
+        # to widen relative to the dim^2-scaling pointwise convs below.
+        self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim)
         # Okay, technically AdaGN, but it's really just FiLM with a GroupNorm layer.
         self.norm = nn.GroupNorm(1, dim)
         self.film = nn.Linear(cond_dim, 2 * dim)

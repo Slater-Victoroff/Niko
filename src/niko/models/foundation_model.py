@@ -48,6 +48,7 @@ class FoundationModel(nn.Module):
         encoder: EncoderBase,
         operator: OperatorBase,
         decoders: Dict[str, DecoderBase],
+        boundary_geometry: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.field_embedder = field_embedder
@@ -55,6 +56,12 @@ class FoundationModel(nn.Module):
         self.encoder = encoder
         self.operator = operator
         self.decoders = nn.ModuleDict(decoders)
+        # See encoders/context_cond.py's BoundaryGeometryHead / core/boundary.py.
+        # Optional (None disables it entirely, falling back to every spatial
+        # derivative/conv's old unconditional-circular-or-zero-pad behavior) so
+        # existing call sites/checkpoints that don't pass this keep working
+        # unchanged.
+        self.boundary_geometry = boundary_geometry
 
         self.complex_proj = None
         if getattr(operator, "complex_term", False):
@@ -75,6 +82,8 @@ class FoundationModel(nn.Module):
         trunk_modules = [field_embedder, context_cond_encoder, encoder, operator]
         if self.complex_proj is not None:
             trunk_modules.append(self.complex_proj)
+        if self.boundary_geometry is not None:
+            trunk_modules.append(self.boundary_geometry)
         trunk_params = sum(p.numel() for m in trunk_modules for p in m.parameters())
         print(f"FoundationModel shared trunk params: {trunk_params}")
         for name, dec in self.decoders.items():
@@ -82,11 +91,26 @@ class FoundationModel(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"FoundationModel total params (trunk + all decoders): {total_params}")
 
-    def rollout_latent(self, z0: LatentState, steps: int, cond: Optional[Tensor] = None) -> List[LatentState]:
+    def rollout_latent(
+        self, z0: LatentState, steps: int, cond: Optional[Tensor] = None,
+        bc_weights: Optional[tuple] = None, n_substeps: int = 1,
+    ) -> List[LatentState]:
+        # n_substeps=1 (default) is exactly the original behavior, unchanged for
+        # every existing config/checkpoint: one full-dt operator call per output
+        # frame. n_substeps>1 instead calls the operator n_substeps times per
+        # output frame at dt=1/n_substeps each -- ported from
+        # LatentDynamicsModel.rollout_latent (models/dynamics_model.py), the
+        # single-task path this was originally developed/validated on -- see its
+        # docstring and EXPERIMENT_LOG.md §20/§23 for the DISCO-inspired
+        # motivation. Only the intermediate substeps are hidden from `preds` --
+        # one entry per REQUESTED output frame (`steps`), same contract as
+        # before, decoded at the same points regardless of n_substeps.
+        dt = 1.0 / n_substeps
         preds = []
         z = z0
         for _ in range(steps):
-            z = self.operator(z, cond=cond)
+            for _ in range(n_substeps):
+                z = self.operator(z, cond=cond, bc_weights=bc_weights, dt=dt)
             preds.append(z)
         return preds
 
@@ -97,13 +121,15 @@ class FoundationModel(nn.Module):
         task: str,
         steps: int,
         return_initial_encode: bool = True,
+        n_substeps: int = 1,
     ) -> Tensor:
         if task not in self.decoders:
             raise ValueError(f"Unknown task '{task}'; known tasks: {list(self.decoders.keys())}")
 
-        x_context = self.field_embedder(x_context_raw, field_spec)  # [B, T, canonical_dim, H, W]
+        x_context = self.field_embedder(x_context_raw, field_spec, task)  # [B, T, canonical_dim, H, W]
         cond = self.context_cond_encoder(x_context)
         z0 = self.encoder(x_context)
+        bc_weights = self.boundary_geometry(x_context, task) if self.boundary_geometry is not None else None
 
         if self.complex_proj is not None:
             last_frame = x_context[:, -1]  # [B, canonical_dim, H, W]
@@ -113,17 +139,25 @@ class FoundationModel(nn.Module):
             re, im = proj.chunk(2, dim=1)
             z0 = z0.replace_state(real_grid=z0.real_grid, spectral_grid=torch.complex(re, im))
 
-        zs = self.rollout_latent(z0, steps=steps, cond=cond)
+        zs = self.rollout_latent(z0, steps=steps, cond=cond, bc_weights=bc_weights, n_substeps=n_substeps)
 
         decoder = self.decoders[task]
         zs_stacked = torch.stack([z.grid for z in zs], dim=1)
         B, T = zs_stacked.shape[:2]
         zs_flat = zs_stacked.reshape(B * T, *zs_stacked.shape[2:])
         cond_flat = cond[:, None, :].expand(B, T, cond.shape[-1]).reshape(B * T, cond.shape[-1])
-        response_flat = decoder(zs_flat, cond=cond_flat)
+        if bc_weights is not None:
+            wx, wy = bc_weights
+            bc_weights_flat = (
+                wx[:, None, :].expand(B, T, 3).reshape(B * T, 3),
+                wy[:, None, :].expand(B, T, 3).reshape(B * T, 3),
+            )
+        else:
+            bc_weights_flat = None
+        response_flat = decoder(zs_flat, cond=cond_flat, bc_weights=bc_weights_flat)
         response = response_flat.reshape(B, T, *response_flat.shape[1:])
 
         if return_initial_encode:
-            decoded_last_frame = decoder(z0.grid, cond=cond)
+            decoded_last_frame = decoder(z0.grid, cond=cond, bc_weights=bc_weights)
             return decoded_last_frame, response
         return response
