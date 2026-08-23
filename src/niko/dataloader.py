@@ -346,35 +346,21 @@ class H5RayleighBenardFields(Dataset):
         # or L/zeta/alpha -- whatever field_spec's dataset uses) parallel to `filepaths`
         self.file_params = file_params
         self.return_params = bool(return_params)
+        self.traj_limit = traj_limit
 
-        self._pairs: List[PairIndex] = []
+        # _layouts only needs each file's HDF5 metadata (n_traj/time_steps/shapes), read
+        # once here -- resample_epoch() below rebuilds _pairs from this cached metadata
+        # with zero further file I/O, which is what makes per-epoch trajectory
+        # resampling (2026-08-23, see EXPERIMENT_LOG.md) cheap enough to actually do
+        # every epoch instead of only once at construction.
         self._layouts: List[Dict[str, Any]] = []
         if file_limit is not None:
             self.files = self.files[:file_limit]
-        for fi, path in enumerate(self.files):
+        for path in self.files:
             with h5py.File(path, "r") as f:
-                layout = self._inspect_layout(f, path)
-                self._layouts.append(layout)
-                n_traj = layout["n_traj"]
-                T = layout["time_steps"]
-                if traj_limit is not None and traj_limit < n_traj:
-                    # Seeded random sample, not a positional head-slice -- see the
-                    # 2026-08-19 comment above self.traj_seed for why. Sorted purely
-                    # for deterministic/readable _pairs ordering; the *set* of indices
-                    # is what matters, not their order.
-                    traj_indices = sorted(random.Random(self.traj_seed + fi).sample(range(n_traj), traj_limit))
-                else:
-                    traj_indices = list(range(n_traj))
+                self._layouts.append(self._inspect_layout(f, path))
 
-            needed = self.context_frames + self.predict_frames
-
-            max_start = -1
-            if T >= needed:
-                max_start = T - needed
-
-            for tj in traj_indices:
-                for s in range(0, max_start + 1, self.pair_stride):
-                    self._pairs.append(PairIndex(fi, tj, s))
+        self._pairs: List[PairIndex] = self._build_pairs(epoch=0)
 
         self._open_file_idx: Optional[int] = None
         self._h5: Optional[h5py.File] = None
@@ -435,6 +421,60 @@ class H5RayleighBenardFields(Dataset):
             "y_len": y_len,
             "fields": field_layouts,
         }
+
+    def _build_pairs(self, epoch: int) -> List["PairIndex"]:
+        """The traj_limit-affected trajectory selection, and the (file, traj, start)
+        pairs built from it -- separated out from __init__ so resample_epoch() can
+        redo just this part (pure index arithmetic over the already-cached
+        self._layouts, no file I/O) instead of needing to reconstruct the whole
+        dataset. epoch=0 reproduces the exact selection __init__ always used before
+        this method existed (seed = self.traj_seed + fi, unchanged), so a caller that
+        never calls resample_epoch sees byte-identical behavior to before.
+
+        2026-08-23: found (see EXPERIMENT_LOG.md) that traj_limit's seeded-random
+        selection -- itself already a fix for an earlier positional-slice bug -- was
+        still only ever drawn ONCE, at construction, and never refreshed: a task like
+        euler_multi_quadrants_openBC (traj_limit=3 of 400/file) would see the exact
+        same 3 trajectories per file for an entire multi-epoch run, no matter how many
+        epochs it trained for. Folding `epoch` into the seed lets resample_epoch draw
+        a genuinely different sample each time it's called, so a long enough run
+        sweeps through much more of the real data over time -- while keeping the same
+        bounded-memory contract as before (this only ever changes which small set of
+        trajectory INDICES are in scope; the actual per-trajectory tensor data is still
+        loaded lazily into the capacity-bounded traj_cache in __getitem__, never all
+        held in memory at once).
+        """
+        pairs: List["PairIndex"] = []
+        needed = self.context_frames + self.predict_frames
+        for fi, layout in enumerate(self._layouts):
+            n_traj = layout["n_traj"]
+            T = layout["time_steps"]
+            if self.traj_limit is not None and self.traj_limit < n_traj:
+                # Large multiplier keeps each epoch's draw independent of any other
+                # (fi, epoch) pair's own draw -- fi only ever spans a few dozen files
+                # at most, so this can't collide in practice.
+                seed = self.traj_seed + fi + int(epoch) * 1_000_003
+                traj_indices = sorted(random.Random(seed).sample(range(n_traj), self.traj_limit))
+            else:
+                traj_indices = list(range(n_traj))
+
+            max_start = -1
+            if T >= needed:
+                max_start = T - needed
+
+            for tj in traj_indices:
+                for s in range(0, max_start + 1, self.pair_stride):
+                    pairs.append(PairIndex(fi, tj, s))
+        return pairs
+
+    def resample_epoch(self, epoch: int) -> None:
+        """Redraws which trajectories are in scope for this epoch (a no-op when
+        traj_limit doesn't apply -- every trajectory is already in scope, nothing to
+        redraw). Called once per epoch by StreamingBlockBatchSampler.set_epoch (see
+        its dataset= param) for the train loader; validation deliberately does NOT
+        call this -- see create_param_dataloaders' val_traj_limit docstring for why
+        validation's fix is a bigger fixed sample instead of a moving one."""
+        self._pairs = self._build_pairs(epoch)
 
     def __len__(self) -> int:
         return len(self._pairs)
@@ -634,6 +674,24 @@ def select_representative_files(files: List[str], k: int, key_fn) -> List[str]:
     return [sorted(groups[key])[0] for key in picked_keys]
 
 
+def select_random_files(files: List[str], k: int, seed: int = 42) -> List[str]:
+    """select_representative_files' sibling for datasets with no meaningful
+    simulation_parameters to span (e.g. acoustic_scattering_*, whose files are
+    documented as unlabeled homogeneous chunks -- simulation_parameters=[] --
+    so there's no key_fn to group/space by). A plain file_limit's
+    sorted(os.listdir(...))[:k] is the exact same class of bug traj_limit had
+    (2026-08-19 fix, see H5RayleighBenardFields.traj_seed's docstring): a fixed
+    positional head-slice, always the same k files, regardless of whether
+    alphabetical order actually correlates with anything (e.g. generation
+    batch/seed) -- "the files are homogeneous" was an assumption, not something
+    ever verified, and even if true, there's no reason to prefer alphabetical
+    order over any other. Seeded random sample instead -- reproducible, not
+    positional. Sorted purely for deterministic/readable output ordering."""
+    if k >= len(files):
+        return list(files)
+    return sorted(random.Random(seed).sample(files, k))
+
+
 def _round_sig(x: float, sig: int = 6) -> float:
     """Round to `sig` significant figures (not fixed decimal places -- params
     here span both huge (Rayleigh ~1e10) and small (Prandtl 0.1) magnitudes,
@@ -689,6 +747,7 @@ class StreamingBlockBatchSampler(Sampler[List[int]]):
         drop_last: bool = False,
         prefer_file_diversity: bool = True,
         rotate_blocks: bool = True,
+        dataset: Optional["H5RayleighBenardFields"] = None,
     ):
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
@@ -702,19 +761,31 @@ class StreamingBlockBatchSampler(Sampler[List[int]]):
         self.drop_last = bool(drop_last)
         self.prefer_file_diversity = bool(prefer_file_diversity)
         self.rotate_blocks = bool(rotate_blocks)
+        # 2026-08-23: optional back-reference to the dataset these pairs came from --
+        # set_epoch uses this to pull a freshly-resampled self.dataset._pairs and
+        # rebuild self.blocks from it every epoch, instead of only ever reordering the
+        # SAME fixed pairs list handed in at construction (see resample_epoch's own
+        # docstring/EXPERIMENT_LOG.md for why a fixed-forever pool was a real problem).
+        # None (the default) preserves the exact old behavior for any caller that
+        # constructs this sampler directly without a dataset reference.
+        self.dataset = dataset
         self.epoch = 0
 
-        self.blocks: List[Dict[str, Any]] = []
+        self.blocks: List[Dict[str, Any]] = self._build_blocks(self.pairs)
+        self.total_samples = sum(len(b["indices"]) for b in self.blocks)
+
+    def _build_blocks(self, pairs: List[PairIndex]) -> List[Dict[str, Any]]:
+        blocks: List[Dict[str, Any]] = []
         current_indices: List[int] = []
         current_key: Optional[Tuple[int, int]] = None
 
-        for idx, p in enumerate(self.pairs):
+        for idx, p in enumerate(pairs):
             key = (p.file_idx, p.traj_idx)
             if current_key is None:
                 current_key = key
 
             if key != current_key or len(current_indices) >= self.block_size:
-                self.blocks.append(
+                blocks.append(
                     {
                         "indices": current_indices,
                         "file_idx": current_key[0],
@@ -728,18 +799,22 @@ class StreamingBlockBatchSampler(Sampler[List[int]]):
 
         if current_indices:
             assert current_key is not None
-            self.blocks.append(
+            blocks.append(
                 {
                     "indices": current_indices,
                     "file_idx": current_key[0],
                     "traj_idx": current_key[1],
                 }
             )
-
-        self.total_samples = sum(len(b["indices"]) for b in self.blocks)
+        return blocks
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
+        if self.dataset is not None:
+            self.dataset.resample_epoch(epoch)
+            self.pairs = self.dataset._pairs
+            self.blocks = self._build_blocks(self.pairs)
+            self.total_samples = sum(len(b["indices"]) for b in self.blocks)
 
     def _pop_preferred_block(
         self,
@@ -879,6 +954,7 @@ def create_param_dataloaders(
     train_file_limit: Optional[int] = None,
     val_file_limit: Optional[int] = None,
     traj_limit: Optional[int] = None,
+    val_traj_limit: Optional[int] = None,
     pair_stride: int = 1,
     context_frames: int = 1,
     predict_frames: int = 1,
@@ -1002,7 +1078,15 @@ def create_param_dataloaders(
         val_files,
         field_spec=field_spec,
         file_limit=val_file_limit,
-        traj_limit=traj_limit,
+        # 2026-08-23: deliberately NOT `traj_limit` -- see val_traj_limit's own
+        # parameter position/EXPERIMENT_LOG.md. Validation only runs once per epoch
+        # (vs. training's many repeats), so it can afford a much more complete
+        # trajectory sample than training's per-step-cost-driven traj_limit, and
+        # unlike training (which now resamples every epoch, see resample_epoch),
+        # validation deliberately stays FIXED across a run's epochs -- a moving
+        # target would make epoch-over-epoch valid_loss comparisons meaningless.
+        # Default None = every available trajectory in the selected val files.
+        traj_limit=val_traj_limit,
         pair_stride=pair_stride,
         context_frames=context_frames,
         predict_frames=predict_frames,
@@ -1023,6 +1107,11 @@ def create_param_dataloaders(
         drop_last=False,
         prefer_file_diversity=True,
         rotate_blocks=True,
+        # dataset=trainset (not just its current _pairs snapshot): lets set_epoch
+        # actually resample trainset's trajectory selection each epoch and rebuild
+        # this sampler's blocks from the fresh result -- see resample_epoch's
+        # docstring. Without this, set_epoch only reordered the SAME fixed pool.
+        dataset=trainset,
     )
     train_loader = DataLoader(
         trainset,

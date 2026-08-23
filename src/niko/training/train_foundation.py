@@ -233,7 +233,13 @@ def build_tasks(data_root: str, config_root: str, task_set: str = "core3") -> di
             param_subset=None,
             train_file_limit=4,
             val_file_limit=2,
+            # 2026-08-23: no simulation_parameters here (see select_random_files'
+            # docstring) so select_representative_files' key_fn approach doesn't apply
+            # -- random selection instead of a positional head-slice is still the
+            # right fix (same bug class as the pre-2026-08-19 traj_limit issue).
+            file_select_fn=lambda files, k: dl.select_random_files(files, k),
             traj_limit=15,  # of ~100 trajectories/file; files are unlabeled homogeneous chunks, not param combos
+            val_traj_limit=40,  # validation can afford more -- see val_traj_limit's own docstring
             batch=8,
             traj_cache_capacity=_traj_cache_capacity(102, 3, 256, 256),
             # pressure = acoustic perturbation from the (separately-stored, static,
@@ -252,6 +258,7 @@ def build_tasks(data_root: str, config_root: str, task_set: str = "core3") -> di
             val_file_limit=4,
             file_select_fn=lambda files, k: dl.select_representative_files(files, k, _param_key),
             traj_limit=3,  # of 400 realizations/file -- the real volume lever here
+            val_traj_limit=20,  # validation can afford more -- see val_traj_limit's own docstring
             batch=2,  # 512x512 x 5 channels, largest per-sample footprint of any task here
             traj_cache_capacity=_traj_cache_capacity(101, 5, 512, 512),
             # compressible Euler: density/energy/pressure all vary independently, this is
@@ -267,6 +274,7 @@ def build_tasks(data_root: str, config_root: str, task_set: str = "core3") -> di
         train_file_limit=6,  # all of them -- each is a distinct (F,k) combo, real physical diversity
         val_file_limit=6,
         traj_limit=2,  # of 160 realizations/file
+        val_traj_limit=20,  # validation can afford more -- see val_traj_limit's own docstring
         pair_stride=15,  # T=1001 -- a single trajectory alone yields ~990 windows otherwise
         batch=8,
         traj_cache_capacity=_traj_cache_capacity(1001, 2, 128, 128),
@@ -282,6 +290,7 @@ def build_tasks(data_root: str, config_root: str, task_set: str = "core3") -> di
         val_file_limit=8,
         file_select_fn=lambda files, k: dl.select_representative_files(files, k, _param_key),
         traj_limit=5,  # of 26 trajectories/file
+        val_traj_limit=15,  # more than half of 26 -- generous since it's a small pool to begin with
         batch=4,  # 1024x256 grid -- same pixel count as euler's 512x512
         traj_cache_capacity=_traj_cache_capacity(50, 2, 1024, 256),
         # frequency-domain acoustics: no velocity field, pressure_re/pressure_im are a
@@ -700,6 +709,20 @@ def main():
                          "task -- e.g. --train-file-limit-override 2).")
     p.add_argument("--val-file-limit-override", type=int, default=None,
                     help="same as --train-file-limit-override, for val_file_limit.")
+    p.add_argument("--traj-limit-override", type=int, default=None,
+                    help="overrides every selected task's own traj_limit (trajectories/realizations "
+                         "used per file). build_tasks() sets this conservatively per-task to keep any "
+                         "one task's per-epoch budget from dominating a shared multi-task trunk (e.g. "
+                         "gray_scott_reaction_diffusion's traj_limit=2 of 160 available) -- that "
+                         "tradeoff doesn't apply when --task-subset isolates a single task, where it "
+                         "just means training on a small fraction of the data actually on disk for no "
+                         "reason. Pass None (the default) to leave build_tasks()'s own per-task value "
+                         "alone; pass a value larger than what's on disk to use everything available.")
+    p.add_argument("--pair-stride-override", type=int, default=None,
+                    help="same idea as --traj-limit-override, for pair_stride (samples every Nth valid "
+                         "context/rollout start position within a trajectory instead of every one -- "
+                         "see H5RayleighBenardFields's own docstring). Also set conservatively per-task "
+                         "in build_tasks() for the same shared-trunk-budget reason.")
     p.add_argument("--param-subset-override", default=None,
                     help="overrides every selected task's own param_subset path -- needed instead of/on "
                          "top of --train-file-limit-override for tasks (e.g. shear_flow) whose file "
@@ -744,6 +767,13 @@ def main():
         for cfg in tasks.values():
             cfg["param_subset"] = args.param_subset_override
 
+    if args.traj_limit_override is not None:
+        for cfg in tasks.values():
+            cfg["traj_limit"] = args.traj_limit_override
+    if args.pair_stride_override is not None:
+        for cfg in tasks.values():
+            cfg["pair_stride"] = args.pair_stride_override
+
     channel_specs = union_channel_specs(tasks)
     print(f"Canonical field registry: {channel_specs}")
 
@@ -786,7 +816,8 @@ def main():
             cfg["data_dir"], batch_size=task_batch, context_frames=T, predict_frames=K,
             num_workers=args.num_workers, param_choices=param_choices,
             train_file_limit=cfg.get("train_file_limit"), val_file_limit=cfg.get("val_file_limit"),
-            traj_limit=cfg.get("traj_limit"), pair_stride=cfg.get("pair_stride", 1),
+            traj_limit=cfg.get("traj_limit"), val_traj_limit=cfg.get("val_traj_limit"),
+            pair_stride=cfg.get("pair_stride", 1),
             field_spec=cfg["field_spec"], traj_cache_capacity=cfg["traj_cache_capacity"],
             file_select_fn=cfg.get("file_select_fn"),
         )
@@ -819,6 +850,19 @@ def main():
     task_iters = {t: repeat_forever(train_loaders[t]) for t in task_names}
 
     for ep in range(1, args.epochs + 1):
+        # 2026-08-23: fixes two real, related bugs found while auditing whether
+        # training/validation actually sample representatively (EXPERIMENT_LOG.md):
+        # (1) StreamingBlockBatchSampler.set_epoch existed but was never called, so
+        # every epoch (and every mid-epoch restart via repeat_forever) reseeded
+        # identically and produced the exact same batch order every time; (2) that
+        # same set_epoch call now also triggers each train_loader's dataset to
+        # resample_epoch(ep) -- see its docstring -- so a traj_limit-constrained
+        # task's trajectory selection actually rotates over the course of a run
+        # instead of being drawn once and reused forever. No-op for tasks without
+        # traj_limit (nothing to resample). Validation is deliberately untouched --
+        # see val_traj_limit's docstring in dataloader.py.
+        for t in task_names:
+            train_loaders[t].batch_sampler.set_epoch(ep)
         model.train()
         loss_sum = 0.0
         task_loss_sum = {t: 0.0 for t in task_names}
