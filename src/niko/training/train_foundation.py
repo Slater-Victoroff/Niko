@@ -60,10 +60,10 @@ from encoders.sequence_conv import SequenceConvEncoder
 from operators.transport_operator import TransportOperator
 from decoders.shared_heads import SharedTrunkFieldHeadsDecoder
 from models.foundation_model import FoundationModel
-from training.losses import well_style_vrmse
+from training.losses import well_style_vrmse, well_style_nrmse
 from training.diagnostics import (
     grad_norms_by_component, pcgrad_conflict_stats, rollout_drift_stats,
-    boundary_geometry_snapshot, log_diagnostics_step,
+    boundary_geometry_snapshot, log_diagnostics_step, _component_group,
 )
 from core.soap import SOAP
 import dataloader as dl
@@ -671,6 +671,15 @@ def main():
                          "the hundreds on early/unstable batches), so it's worth knowing whether a looser bound "
                          "changes anything, not just assuming 1.0 is correct because it's what's always been "
                          "used. Default 1.0 keeps every existing invocation's behavior unchanged.")
+    p.add_argument("--loss-fn", default="vrmse", choices=["vrmse", "nrmse_well"],
+                    help="the objective function used for BOTH the training loss and validation -- vrmse "
+                         "(well_style_vrmse, default, unchanged behavior) normalizes RMSE by the target's own "
+                         "spatial std, which blows up ~100x+ on windows where the target has converged to a "
+                         "spatially-constant state (confirmed on gray_scott's 'gliders' pattern -- see "
+                         "training/losses.py's well_style_nrmse docstring/EXPERIMENT_LOG.md). nrmse_well "
+                         "(well_style_nrmse, The Well's own published Eq. 6) normalizes by the target's RMS "
+                         "(magnitude) instead of its spread, which degrades far more gracefully on those same "
+                         "windows (4.8 vs vrmse's 35.8 on the confirmed worst case) without excluding any data.")
     p.add_argument("--pcgrad", action=argparse.BooleanOptionalAction, default=True,
                     help="PCGrad (see pcgrad_combine): deconflict each task's gradient against every other "
                          "task's before summing, instead of just summing them directly. On by default for any "
@@ -746,6 +755,9 @@ def main():
                          "hundreds of times per epoch (core3's active_matter already does this ~47x "
                          "with 3 tasks; at 14 tasks the smallest natural loaders are ~10x smaller still).")
     args = p.parse_args()
+    # Selected once, used everywhere well_style_vrmse used to be hardcoded -- see
+    # --loss-fn's own help text for what each option is and why this exists.
+    loss_fn = well_style_vrmse if args.loss_fn == "vrmse" else well_style_nrmse
 
     dev = torch.device(args.device)
     torch.cuda.set_device(dev)
@@ -891,7 +903,7 @@ def main():
                     # supervision. See FoundationModel.forward_dense_singlestep.
                     pred, target_raw = model.forward_dense_singlestep(
                         xb, yb, field_spec=tasks[task]["field_spec"], task=task, n_substeps=args.n_substeps)
-                    raw_task_loss = well_style_vrmse(pred, target_raw).mean()
+                    raw_task_loss = loss_fn(pred, target_raw).mean()
                 else:
                     # return_latents only on the probe task, only at logged steps -- reuses
                     # this already-scheduled forward call (no extra one added) to also get
@@ -906,8 +918,8 @@ def main():
                     else:
                         initial, pred = out
                     initial_target = xb[:, -1, ...]
-                    initial_loss = well_style_vrmse(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()
-                    rollout_loss = well_style_vrmse(pred, yb).mean()
+                    initial_loss = loss_fn(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()
+                    rollout_loss = loss_fn(pred, yb).mean()
                     raw_task_loss = (1.0 / K) * initial_loss + rollout_loss
 
                 task_loss = soft_cap_loss(raw_task_loss, args.loss_cap_threshold)
@@ -979,7 +991,7 @@ def main():
                         pred = model(xb, field_spec=tasks[t]["field_spec"], task=t, steps=K,
                                      return_initial_encode=False, n_substeps=args.n_substeps)
                         target = yb
-                    vlosses.append(float(well_style_vrmse(pred, target).mean().item()))
+                    vlosses.append(float(loss_fn(pred, target).mean().item()))
                 # 2026-08-23: validation had no outlier-batch protection at all, unlike
                 # training's soft_cap_loss -- flagged repeatedly as an open gap across
                 # this whole project (see EXPERIMENT_LOG.md), confirmed as a real,
@@ -1021,7 +1033,8 @@ def main():
         # Same _sub{N} tag convention as train.py's single-task checkpoints -- absent
         # (empty string) at the N=1 default so every existing filename is unaffected.
         substep_tag = f"_sub{args.n_substeps}" if args.n_substeps != 1 else ""
-        ckpt_out = save_dir / f"foundation_ep{ep}_ctx{T}_roll{K}{substep_tag}_avg{avg_val:.4f}.pt"
+        loss_fn_tag = f"_{args.loss_fn}" if args.loss_fn != "vrmse" else ""
+        ckpt_out = save_dir / f"foundation_ep{ep}_ctx{T}_roll{K}{substep_tag}{loss_fn_tag}_avg{avg_val:.4f}.pt"
         torch.save({
             # The whole registered module tree in one call -- field_embedder (every
             # per-task copy), context_cond_encoder, encoder, operator, complex_proj
@@ -1040,6 +1053,7 @@ def main():
             "model_config": model_config,
             "rollout_steps": K,
             "n_substeps": args.n_substeps,
+            "loss_fn": args.loss_fn,
             "epoch": ep,
             "val_loss_by_task": val_results,
         }, ckpt_out)

@@ -74,6 +74,55 @@ def well_style_vrmse(
     return torch.sqrt(mse / (var + eps))
 
 
+def well_style_nrmse(
+    pred: Tensor,
+    target: Tensor,
+    eps: float = 1e-7,
+) -> Tensor:
+    """The Well's own published NRMSE (Eq. 6): RMSE / (target RMS + eps), per
+    channel -- same [B, K, C, H, W] -> [B, K, C] contract as well_style_vrmse
+    above, so it's a drop-in replacement anywhere that's used (train_foundation.py's
+    --loss-fn flag selects between them for both the training objective and
+    validation).
+
+    2026-08-23: built after well_style_vrmse's std-normalization was found (via
+    eval/eval_foundation_nrmse.py, then confirmed against a real worst-case
+    gray_scott validation sample -- see EXPERIMENT_LOG.md) to blow up ~100x+ on
+    windows where the target has genuinely converged to a spatially-constant
+    state (std -> 0) even though the model's prediction was within a few percent
+    in absolute terms -- a metric-normalization artifact on physically-boring
+    states, not a real prediction failure. RMS (this function's denominator)
+    captures the target's MAGNITUDE, not its spread, so a converged-but-nonzero
+    field (e.g. gray_scott's A channel saturating to ~1.0) still gets a normal,
+    well-behaved denominator here even though std-based normalization breaks
+    down for it. Confirmed via that same worst-case sample: vrmse 35.8 -> this
+    metric 4.8.
+
+    NOT immune to the same class of problem when the target's magnitude ALSO
+    goes to zero (not just its spread) -- gray_scott's other channel (B) can
+    decay toward genuinely near-zero magnitude in the same converged windows,
+    which is why eps appears twice here (once inside the sqrt, once in the
+    final division) rather than once: a single un-square-rooted eps=1e-7 floor
+    (what nrmse_range/nrmse_mean in eval_foundation_nrmse.py use) was found to
+    be too thin for that case specifically (blew up to ~15000 on the same
+    worst-case sample, worse than plain vrmse) -- the double, partially-
+    square-rooted floor here degrades far more gracefully.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
+
+    if pred.ndim != 5:
+        raise ValueError(f"Expected [B, K, C, H, W], got {tuple(pred.shape)}")
+
+    spatial_dims = (-2, -1)
+
+    mse = (pred - target).float().pow(2).mean(dim=spatial_dims)
+    rmse = mse.sqrt()
+    target_rms = (target.float().pow(2).mean(dim=spatial_dims) + eps).sqrt()
+
+    return rmse / (target_rms + eps)
+
+
 def _phys_dx(x: Tensor) -> Tensor:
     return 0.5 * (torch.roll(x, -1, -1) - torch.roll(x, 1, -1))
 
