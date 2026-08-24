@@ -123,6 +123,97 @@ def well_style_nrmse(
     return rmse / (target_rms + eps)
 
 
+def compute_channel_scale(loader, n_batches: int = 50, eps: float = 1e-7) -> Tensor:
+    """Pools RAW target values across n_batches real batches into one stable
+    per-channel RMS reference -- used by well_style_nrmse_fixed instead of
+    well_style_nrmse's per-sample-per-batch dynamic normalization.
+
+    Deliberately pools every sampled batch's values into ONE running
+    sum-of-squares (not "average each batch's own RMS together") -- averaging
+    per-batch RMS estimates would still let one unusually-quiet batch pull the
+    average down; pooling raw sums-of-squares means the estimate is dominated
+    by the SAME total volume of data regardless of how any individual batch
+    happens to look, exactly the stability property a per-batch estimate
+    lacks. n_batches=50 (default) is enough to average out ordinary batch-to-
+    batch variation without scanning a whole epoch -- see EXPERIMENT_LOG.md
+    for the well_style_nrmse investigation this was built to fix.
+
+    Returns a [C] tensor (one scale per channel), meant to be computed once
+    per task at training start and reused for every batch/epoch after --
+    NOT recomputed per batch, which is the entire point.
+    """
+    sq_sum = None
+    n_elements = None
+    seen = 0
+    it = iter(loader)
+    for _ in range(n_batches):
+        try:
+            _, yb, _ = next(it)
+        except StopIteration:
+            it = iter(loader)
+            _, yb, _ = next(it)
+        # yb: [B, K, C, H, W] -- pool over every dim except C.
+        y = yb.float()
+        c = y.shape[2]
+        y_c = y.movedim(2, 0).reshape(c, -1)  # [C, B*K*H*W]
+        batch_sq_sum = y_c.pow(2).sum(dim=1)
+        if sq_sum is None:
+            sq_sum = batch_sq_sum
+            n_elements = torch.full((c,), y_c.shape[1], dtype=torch.float64)
+        else:
+            sq_sum += batch_sq_sum
+            n_elements += y_c.shape[1]
+        seen += 1
+    return (sq_sum.double() / n_elements + eps).sqrt().float()
+
+
+def well_style_nrmse_fixed(pred: Tensor, target: Tensor, channel_scale: Tensor, eps: float = 1e-7) -> Tensor:
+    """Like well_style_nrmse, but normalizes by a FIXED, precomputed per-channel
+    RMS (see compute_channel_scale) instead of recomputing the reference fresh
+    from each batch's own target.
+
+    2026-08-24: built after tracing a real, chronic (not rare-outlier) problem
+    with well_style_nrmse's per-batch normalization -- traced directly via
+    per-decoder-head gradient norms on shear_flow (see EXPERIMENT_LOG.md):
+    shear_flow's pressure channel (RMS~0.066) is ~5x smaller than its siblings
+    (vx~0.344, tracer~0.325), and because the loss's normalization denominator
+    is recomputed from each batch's OWN local statistics, the gradient
+    contribution from pressure varied wildly batch to batch (15-300x its
+    siblings', not a stable ratio) -- decoder.shear_flow's pre-clip gradient
+    norm hit 1000+ on some batches (vs. a ~10-50 typical), forcing the SAME
+    global clip to rescale the other two tasks' perfectly healthy gradients
+    down by the same huge, unpredictable factor every time it happened
+    (80%+ of logged steps in one real run).
+
+    This does NOT remove the cross-channel weighting itself -- a channel that's
+    naturally 5x smaller than its siblings still gets proportionally more
+    gradient weight per unit of relative error, which is the whole legitimate
+    reason a normalized loss exists in the first place (so heterogeneous-unit
+    channels combine into one meaningful scalar). What changes is that the
+    weighting is now a STABLE, predictable ratio (computed once, from a large
+    pooled sample) instead of one that swings 15-300x depending on which
+    specific window happened to be in this batch -- removing the noise/
+    instability without silently changing what "good performance" means.
+
+    Also inherits the same near-zero-target robustness well_style_nrmse has
+    over well_style_vrmse (RMS-normalized, not std-normalized) -- and is
+    actually MORE robust to it than well_style_nrmse, since a single
+    degenerate (near-constant or fully-decayed) window can no longer drag its
+    own denominator down at all; the reference is fixed regardless of what
+    that specific window looks like.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
+    if pred.ndim != 5:
+        raise ValueError(f"Expected [B, K, C, H, W], got {tuple(pred.shape)}")
+
+    spatial_dims = (-2, -1)
+    mse = (pred - target).float().pow(2).mean(dim=spatial_dims)  # [B, K, C]
+    rmse = mse.sqrt()
+    scale = channel_scale.to(rmse.device).view(1, 1, -1)
+    return rmse / (scale + eps)
+
+
 def _phys_dx(x: Tensor) -> Tensor:
     return 0.5 * (torch.roll(x, -1, -1) - torch.roll(x, 1, -1))
 

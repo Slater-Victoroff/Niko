@@ -47,7 +47,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import torch
 
@@ -60,9 +60,9 @@ from encoders.sequence_conv import SequenceConvEncoder
 from operators.transport_operator import TransportOperator
 from decoders.shared_heads import SharedTrunkFieldHeadsDecoder
 from models.foundation_model import FoundationModel
-from training.losses import well_style_vrmse, well_style_nrmse
+from training.losses import well_style_vrmse, well_style_nrmse, well_style_nrmse_fixed, compute_channel_scale
 from training.diagnostics import (
-    grad_norms_by_component, pcgrad_conflict_stats, rollout_drift_stats,
+    pcgrad_conflict_stats, rollout_drift_stats,
     boundary_geometry_snapshot, log_diagnostics_step, _component_group,
 )
 from core.soap import SOAP
@@ -449,6 +449,47 @@ def soft_cap_loss(loss: torch.Tensor, threshold: float) -> torch.Tensor:
     return threshold + torch.sqrt(excess + 1.0) - 1.0
 
 
+def clip_grad_norm_by_component(model, max_norm: float) -> Dict[str, float]:
+    """Like torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm), but
+    clips each diagnostic component group's (see training/diagnostics.py's
+    _component_group) gradient norm independently, instead of one norm over
+    every parameter combined.
+
+    Motivating finding (gray_scott investigation, EXPERIMENT_LOG.md): a single
+    global clip means one component's bad-batch spike -- observed as
+    overwhelmingly `encoder`/`decoder`, sometimes 1000x+ over their own
+    typical norm -- rescales the ENTIRE gradient by the same factor, including
+    components (operator.advection, operator.diffusion) whose own gradient
+    that step was perfectly ordinary. grad_norm_pre_clip_total sat above 1.0
+    on 100% of ~500 logged steps across two real runs, meaning the global
+    clip wasn't a rare safety net at all -- it fired every single step,
+    discarding the model's actual per-step confidence signal entirely, not
+    just capping genuine outliers.
+
+    Deliberately uses the SAME max_norm per group rather than per-component-
+    calibrated values (encoder/decoder's own typical scale is ~100x
+    operator.advection's) -- that calibration is real (see the diagnostics
+    percentile breakdown in EXPERIMENT_LOG.md) but is specific to this one
+    task/model's observed distribution and wouldn't transfer to a different
+    dataset's differently-shaped trunk. This isolates exactly one variable
+    (grouping vs. not) against the prior global-clip behavior; a
+    per-component-calibrated version is a distinct, not-yet-made decision.
+
+    Returns the pre-clip norm per component group, same shape as
+    grad_norms_by_component's own return value, so it can reuse that same
+    diagnostics-log slot instead of needing a second, separately-computed one.
+    """
+    groups: Dict[str, List[torch.nn.Parameter]] = {}
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        groups.setdefault(_component_group(name), []).append(p)
+    return {
+        group: float(torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm))
+        for group, params in groups.items()
+    }
+
+
 def union_channel_specs(tasks: dict) -> dict:
     specs = {}
     for cfg in tasks.values():
@@ -671,7 +712,7 @@ def main():
                          "the hundreds on early/unstable batches), so it's worth knowing whether a looser bound "
                          "changes anything, not just assuming 1.0 is correct because it's what's always been "
                          "used. Default 1.0 keeps every existing invocation's behavior unchanged.")
-    p.add_argument("--loss-fn", default="vrmse", choices=["vrmse", "nrmse_well"],
+    p.add_argument("--loss-fn", default="vrmse", choices=["vrmse", "nrmse_well", "nrmse_fixed"],
                     help="the objective function used for BOTH the training loss and validation -- vrmse "
                          "(well_style_vrmse, default, unchanged behavior) normalizes RMSE by the target's own "
                          "spatial std, which blows up ~100x+ on windows where the target has converged to a "
@@ -679,7 +720,18 @@ def main():
                          "training/losses.py's well_style_nrmse docstring/EXPERIMENT_LOG.md). nrmse_well "
                          "(well_style_nrmse, The Well's own published Eq. 6) normalizes by the target's RMS "
                          "(magnitude) instead of its spread, which degrades far more gracefully on those same "
-                         "windows (4.8 vs vrmse's 35.8 on the confirmed worst case) without excluding any data.")
+                         "windows (4.8 vs vrmse's 35.8 on the confirmed worst case) without excluding any data. "
+                         "nrmse_fixed (well_style_nrmse_fixed) normalizes by a FIXED, precomputed-once "
+                         "per-channel RMS (computed at startup, see --loss-fixed-scale-batches) instead of "
+                         "recomputing the reference from each batch's own local statistics -- fixes a real, "
+                         "chronic (not rare-outlier) problem traced on shear_flow's pressure channel: a "
+                         "naturally-smaller-magnitude channel's gradient contribution swung 15-300x batch to "
+                         "batch under nrmse_well/vrmse's per-batch normalization, not a stable ratio, which was "
+                         "enough on its own to force the global gradient clip on 80%+ of logged steps.")
+    p.add_argument("--loss-fixed-scale-batches", type=int, default=50,
+                    help="only used with --loss-fn nrmse_fixed: number of batches per task to pool when "
+                         "computing that task's fixed per-channel RMS reference at startup (see "
+                         "training/losses.py's compute_channel_scale).")
     p.add_argument("--pcgrad", action=argparse.BooleanOptionalAction, default=True,
                     help="PCGrad (see pcgrad_combine): deconflict each task's gradient against every other "
                          "task's before summing, instead of just summing them directly. On by default for any "
@@ -755,9 +807,6 @@ def main():
                          "hundreds of times per epoch (core3's active_matter already does this ~47x "
                          "with 3 tasks; at 14 tasks the smallest natural loaders are ~10x smaller still).")
     args = p.parse_args()
-    # Selected once, used everywhere well_style_vrmse used to be hardcoded -- see
-    # --loss-fn's own help text for what each option is and why this exists.
-    loss_fn = well_style_vrmse if args.loss_fn == "vrmse" else well_style_nrmse
 
     dev = torch.device(args.device)
     torch.cuda.set_device(dev)
@@ -844,6 +893,25 @@ def main():
         val_loaders[task] = val_loader
         print(f"[{task}] {len(train_loader)} train batches/epoch, {len(val_loader)} val batches, batch={task_batch}")
 
+    # channel_scales only computed (and only matters) for --loss-fn nrmse_fixed -- see
+    # its own --loss-fn help text. One fixed per-channel RMS reference per task, pooled
+    # from --loss-fixed-scale-batches real batches at startup, reused for every epoch
+    # after (never recomputed per-batch, which is the entire point).
+    channel_scales = {}
+    if args.loss_fn == "nrmse_fixed":
+        for task in tasks.keys():
+            channel_scales[task] = compute_channel_scale(train_loaders[task], n_batches=args.loss_fixed_scale_batches)
+            print(f"[{task}] fixed channel_scale (RMS, pooled over {args.loss_fixed_scale_batches} batches): "
+                  f"{channel_scales[task].tolist()}")
+
+    def loss_fn(pred, target, task):
+        if args.loss_fn == "vrmse":
+            return well_style_vrmse(pred, target)
+        elif args.loss_fn == "nrmse_well":
+            return well_style_nrmse(pred, target)
+        else:
+            return well_style_nrmse_fixed(pred, target, channel_scales[task])
+
     opt = SOAP(model.parameters(), lr=args.lr)
     params = [p for p in model.parameters() if p.requires_grad]
     pcgrad_rng = random.Random(args.seed)
@@ -903,7 +971,7 @@ def main():
                     # supervision. See FoundationModel.forward_dense_singlestep.
                     pred, target_raw = model.forward_dense_singlestep(
                         xb, yb, field_spec=tasks[task]["field_spec"], task=task, n_substeps=args.n_substeps)
-                    raw_task_loss = loss_fn(pred, target_raw).mean()
+                    raw_task_loss = loss_fn(pred, target_raw, task).mean()
                 else:
                     # return_latents only on the probe task, only at logged steps -- reuses
                     # this already-scheduled forward call (no extra one added) to also get
@@ -918,8 +986,8 @@ def main():
                     else:
                         initial, pred = out
                     initial_target = xb[:, -1, ...]
-                    initial_loss = loss_fn(initial.unsqueeze(1), initial_target.unsqueeze(1)).mean()
-                    rollout_loss = loss_fn(pred, yb).mean()
+                    initial_loss = loss_fn(initial.unsqueeze(1), initial_target.unsqueeze(1), task).mean()
+                    rollout_loss = loss_fn(pred, yb, task).mean()
                     raw_task_loss = (1.0 / K) * initial_loss + rollout_loss
 
                 task_loss = soft_cap_loss(raw_task_loss, args.loss_cap_threshold)
@@ -951,8 +1019,14 @@ def main():
                 else torch.stack(task_grad_vecs).sum(dim=0)
             )
             _set_grads_from_flat(params, combined)
-            comp_grad_norms = grad_norms_by_component(model) if log_this_step else None
-            pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
+            # Per-component clipping (see clip_grad_norm_by_component's own docstring for
+            # why -- a single global clip was firing on 100% of ~500 logged steps across
+            # two real runs, rescaling every component by whichever one happened to spike
+            # that step, encoder/decoder overwhelmingly). Always runs (clipping is a
+            # correctness/stability concern, not a logging one) -- its return value
+            # already IS the pre-clip per-component breakdown grad_norms_by_component used
+            # to be computed separately for, so only the LOGGING of it is conditional.
+            comp_grad_norms = clip_grad_norm_by_component(model, max_norm=args.grad_clip_norm)
             opt.step()
             loss_sum += step_loss
 
@@ -963,8 +1037,7 @@ def main():
                 if args.diagnostics:
                     log_diagnostics_step(diagnostics_path, {
                         "type": "step", "epoch": ep, "step": step, "combined_loss": step_loss,
-                        "grad_norm_pre_clip_total": float(pre_clip_norm.item()),
-                        "grad_norms_by_component": comp_grad_norms,
+                        "grad_norms_by_component_pre_clip": comp_grad_norms,
                         "pcgrad_conflict": conflict_stats,
                         "rollout_drift": {"probe_task": probe_task, **drift_stats} if drift_stats else None,
                     })
@@ -991,7 +1064,7 @@ def main():
                         pred = model(xb, field_spec=tasks[t]["field_spec"], task=t, steps=K,
                                      return_initial_encode=False, n_substeps=args.n_substeps)
                         target = yb
-                    vlosses.append(float(loss_fn(pred, target).mean().item()))
+                    vlosses.append(float(loss_fn(pred, target, t).mean().item()))
                 # 2026-08-23: validation had no outlier-batch protection at all, unlike
                 # training's soft_cap_loss -- flagged repeatedly as an open gap across
                 # this whole project (see EXPERIMENT_LOG.md), confirmed as a real,
@@ -1054,6 +1127,7 @@ def main():
             "rollout_steps": K,
             "n_substeps": args.n_substeps,
             "loss_fn": args.loss_fn,
+            "channel_scales": {t: s.tolist() for t, s in channel_scales.items()},
             "epoch": ep,
             "val_loss_by_task": val_results,
         }, ckpt_out)
