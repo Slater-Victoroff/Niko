@@ -664,6 +664,13 @@ def main():
                     help="soft_cap_loss threshold -- comfortably above any observed normal-batch loss across "
                          "all three tasks (including active_matter's noisier variance-normalized spikes), well "
                          "below where a genuinely anomalous batch's raw loss lands (thousands+)")
+    p.add_argument("--grad-clip-norm", type=float, default=1.0,
+                    help="clip_grad_norm_'s max_norm -- was hardcoded to 1.0 with no way to change it without "
+                         "editing this file. 1.0 is a real, fairly tight bound (see training/diagnostics.py's "
+                         "grad_norms_by_component -- per-component pre-clip norms have been observed well into "
+                         "the hundreds on early/unstable batches), so it's worth knowing whether a looser bound "
+                         "changes anything, not just assuming 1.0 is correct because it's what's always been "
+                         "used. Default 1.0 keeps every existing invocation's behavior unchanged.")
     p.add_argument("--pcgrad", action=argparse.BooleanOptionalAction, default=True,
                     help="PCGrad (see pcgrad_combine): deconflict each task's gradient against every other "
                          "task's before summing, instead of just summing them directly. On by default for any "
@@ -933,7 +940,7 @@ def main():
             )
             _set_grads_from_flat(params, combined)
             comp_grad_norms = grad_norms_by_component(model) if log_this_step else None
-            pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
             opt.step()
             loss_sum += step_loss
 
@@ -962,7 +969,7 @@ def main():
         val_results = {}
         with torch.no_grad():
             for t in task_names:
-                vloss_sum, vbatches = 0.0, 0
+                vlosses = []
                 for xb, yb, _bparams in val_loaders[t]:
                     xb, yb = xb.to(dev), yb.to(dev)
                     if args.dense_singlestep:
@@ -972,11 +979,36 @@ def main():
                         pred = model(xb, field_spec=tasks[t]["field_spec"], task=t, steps=K,
                                      return_initial_encode=False, n_substeps=args.n_substeps)
                         target = yb
-                    vloss_sum += float(well_style_vrmse(pred, target).mean().item())
-                    vbatches += 1
-                vloss_avg = vloss_sum / max(1, vbatches)
-                val_results[t] = vloss_avg
-                print(f"Epoch {ep}   valid_loss[{t}]: {vloss_avg:.6f}")
+                    vlosses.append(float(well_style_vrmse(pred, target).mean().item()))
+                # 2026-08-23: validation had no outlier-batch protection at all, unlike
+                # training's soft_cap_loss -- flagged repeatedly as an open gap across
+                # this whole project (see EXPERIMENT_LOG.md), confirmed as a real,
+                # concrete problem (not hypothetical) via gray_scott's "gliders" pattern:
+                # some windows land on a fully-saturated, exactly-constant ground truth
+                # (std=0), and well_style_vrmse divides by the TARGET's own variance --
+                # a near-zero denominator inflates the reported loss ~100x+ even though
+                # the model's actual absolute prediction was within a few percent of
+                # correct. This is a metric-normalization artifact on physically-boring
+                # converged states, not a real prediction failure -- and NOT a reason to
+                # drop those windows from validation (every window stays; nothing here
+                # excludes any data, see EXPERIMENT_LOG.md's discussion of why that's the
+                # wrong fix). Report the median as the primary/tracked number (what
+                # checkpoint filenames and val_loss_by_task use) since it isn't dominated
+                # by a handful of degenerate-denominator batches, while still printing
+                # the raw mean and outlier count alongside it -- nothing is hidden, the
+                # aggregate just isn't allowed to be dominated by a metric artifact.
+                vlosses_sorted = sorted(vlosses)
+                n = len(vlosses_sorted)
+                if n == 0:
+                    median = mean = float("nan")
+                else:
+                    median = (vlosses_sorted[n // 2] if n % 2
+                              else (vlosses_sorted[n // 2 - 1] + vlosses_sorted[n // 2]) / 2)
+                    mean = sum(vlosses) / n
+                n_outliers = sum(1 for v in vlosses if v > args.loss_cap_threshold)
+                val_results[t] = median
+                print(f"Epoch {ep}   valid_loss[{t}]: median={median:.6f}  mean={mean:.6f}  "
+                      f"batches>{args.loss_cap_threshold:g}: {n_outliers}/{n}")
 
         # Per-task tag in the filename works for core3 (3 short-ish names) but not at
         # scale: 14 task names + losses blew past the filesystem's ~255-byte filename
